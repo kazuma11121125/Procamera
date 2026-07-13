@@ -36,64 +36,33 @@ object ColorTemperatureConverter {
      *   (color correction only depends on ratios, not absolute scale), so this is a
      *   rescaling, not a different correction — see [kelvinToRgbGains]'s derivation.
      */
+    // スマホのBayerセンサーにおける典型的なWBゲインの範囲
+    // 色温度が低い(2500K 暖色) = 青を強くブースト(2.6)、赤は弱め(1.4)
+    private const val R_GAIN_2500 = 1.4
+    private const val B_GAIN_2500 = 2.8
+    
+    // 色温度が高い(8000K 寒色) = 赤を強くブースト(2.8)、青は弱め(1.4)
+    private const val R_GAIN_8000 = 2.8
+    private const val B_GAIN_8000 = 1.4
+
     fun kelvinToRggbGains(kelvin: Double): RggbChannelVector {
-        val (redGain, greenGain, blueGain) = kelvinToRgbGains(kelvin)
-        return RggbChannelVector(redGain, greenGain, greenGain, blueGain)
+        val k = kelvin.coerceIn(MIN_KELVIN, MAX_KELVIN)
+        val t = (k - MIN_KELVIN) / (MAX_KELVIN - MIN_KELVIN)
+        
+        val r = R_GAIN_2500 + t * (R_GAIN_8000 - R_GAIN_2500)
+        val b = B_GAIN_2500 + t * (B_GAIN_8000 - B_GAIN_2500)
+        
+        return RggbChannelVector(r.toFloat(), 1.0f, 1.0f, b.toFloat())
     }
 
-    /**
-     * Pure-Kotlin core of [kelvinToRggbGains], factored out so it can be unit-tested
-     * without touching android.hardware.camera2.params.RggbChannelVector (a framework
-     * class that plain JUnit host tests cannot construct without Robolectric — see
-     * ColorTemperatureConverterTest).
-     */
-    fun kelvinToRgbGains(kelvin: Double): Triple<Float, Float, Float> {
-        val clamped = kelvin.coerceIn(MIN_KELVIN, MAX_KELVIN)
-        val (r, g, b) = blackBodyRgb(clamped)
-        // Correction gains are proportional to the INVERSE of the illuminant's own
-        // apparent color (1/r, 1/g, 1/b) — a warm/low-Kelvin illuminant appears
-        // red-heavy, so correcting it toward white means relatively attenuating red and
-        // boosting blue. We then rescale so the MINIMUM of the three inverse values maps
-        // to exactly 1.0, i.e. multiply every gain by max(r,g,b): the channel that was
-        // strongest in the raw data needs no boost (gain=1.0), the others are boosted
-        // above it in the same ratio a green-pinned normalization would have used, just
-        // without ever going below 1.0.
-        val maxChannel = maxOf(r, g, b)
-        return Triple((maxChannel / r).toFloat(), (maxChannel / g).toFloat(), (maxChannel / b).toFloat())
-    }
-
-    /**
-     * Tanner Helland's approximation (https://tannerhelland.com/2012/09/18/convert-temperature-rgb-algorithm.html),
-     * operating on temperature/100 in the 1000K-40000K domain. Returns un-normalized RGB
-     * in [0, 255] (this function only cares about their *ratios*, so the absolute scale
-     * doesn't matter to the caller).
-     */
-    private fun blackBodyRgb(kelvin: Double): Triple<Double, Double, Double> {
-        val t = kelvin / 100.0
-
-        val red = if (t <= 66.0) {
-            255.0
-        } else {
-            (329.698727446 * (t - 60.0).pow(-0.1332047592)).coerceIn(0.0, 255.0)
-        }
-
-        val green = if (t <= 66.0) {
-            (99.4708025861 * ln(t) - 161.1195681661).coerceIn(0.0, 255.0)
-        } else {
-            (288.1221695283 * (t - 60.0).pow(-0.0755148492)).coerceIn(0.0, 255.0)
-        }
-
-        val blue = when {
-            t >= 66.0 -> 255.0
-            t <= 19.0 -> 0.0
-            else -> (138.5177312231 * ln(t - 10.0) - 305.0447927307).coerceIn(0.0, 255.0)
-        }
-
-        // Guard against the degenerate case (shouldn't happen within our 2500-8000K
-        // range, but any channel passing through 0 would make the normalization above
-        // divide by zero).
-        val safeGreen = if (green <= 0.0) 1.0 else green
-        val safeBlue = if (blue <= 0.0) 1.0 else blue
-        return Triple(red, safeGreen, safeBlue)
+    fun rggbGainsToKelvin(gains: RggbChannelVector): Double {
+        val tR = (gains.red - R_GAIN_2500) / (R_GAIN_8000 - R_GAIN_2500)
+        val tB = (gains.blue - B_GAIN_2500) / (B_GAIN_8000 - B_GAIN_2500)
+        
+        // RとBの推測値の平均をとって安定させる
+        val t = (tR + tB) / 2.0
+        val k = MIN_KELVIN + t * (MAX_KELVIN - MIN_KELVIN)
+        
+        return k.coerceIn(MIN_KELVIN, MAX_KELVIN)
     }
 }

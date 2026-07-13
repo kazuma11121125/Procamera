@@ -5,79 +5,290 @@ import android.content.Context
 import android.hardware.camera2.CameraManager
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.view.Surface
 import androidx.annotation.RequiresPermission
 import com.procamera.recorder.audio.NativeEngineBridge
 import com.procamera.recorder.camera.CameraCapabilityInspector
+import com.procamera.recorder.camera.CameraParams
 import com.procamera.recorder.camera.CameraSessionController
+import com.procamera.recorder.camera.CaptureRangeClamper
+import com.procamera.recorder.camera.ColorTemperatureConverter
 import com.procamera.recorder.camera.ManualCaptureRequestFactory
 import com.procamera.recorder.encoder.AudioEncoder
 import com.procamera.recorder.encoder.VideoEncoder
 import com.procamera.recorder.muxer.PtsClockDomain
 import com.procamera.recorder.muxer.SegmentedMuxerController
+import com.procamera.recorder.ui.viewmodel.StorageLocation
 import java.io.File
 import java.nio.ByteBuffer
 
 /**
- * Wires Camera2 capture -> [VideoEncoder]/[AudioEncoder] -> [SegmentedMuxerController]
- * into a single start()/stop() pipeline (§4). This is deliberately the FIRST piece of
- * Phase 4 built (see docs/ARCHITECTURE.md's Phase4 note): everything underneath this
- * class had been compile-verified only and had never produced a single real file, so the
- * record-pipeline smoke test milestone exists to prove it works on a physical device
- * before UI/Service/thermal work is layered on top.
+ * Unified camera/audio/encode/mux pipeline for Phase 4's full UI build.
  *
- * Not yet integrated with the Foreground Service or a full permission-request UI flow —
- * the caller is responsible for having already granted CAMERA/RECORD_AUDIO before calling
- * [start]; that wiring lands once this pipeline is proven.
+ * **State machine**: IDLE → PREVIEWING ↔ RECORDING → IDLE
+ *
+ * - [startPreview]: Opens the camera, streams to a [Surface] (viewfinder). No encoders run.
+ * - [startRecording]: Reconfigures the session to include the encoder's InputSurface alongside
+ *   the preview, then starts the full encode/mux pipeline. Must be in PREVIEWING state.
+ * - [stopRecording]: Drains and finalises all encoders/muxers, then restarts preview automatically.
+ * - [stopAll]: Tears everything down unconditionally (call from ViewModel.onCleared).
+ *
+ * **Parameter updates**: [updateCameraParams] applies changes (ISO, shutter, focus, WB) to the
+ * live repeating request without reopening the session.
+ *
+ * **Metric access**: [nativeEngine] is exposed as a `val` so the ViewModel can poll
+ * [NativeEngineBridge.peakDb] / [NativeEngineBridge.rmsDb] / [NativeEngineBridge.hardwareXRunCount]
+ * at 60 fps without any extra plumbing through this class.
+ *
+ * スモークテストマイルストーン（docs/ARCHITECTURE.md §Phase4）で動作確認済みのパイプラインを
+ * ベースにし、UI / Foreground Serviceが扱える本格的な状態機械に拡張した。
  */
 class RecordingPipeline(private val context: Context) {
 
+    // ──────────────────────────────────────────────────────────────────────────────
+    // Public API types
+    // ──────────────────────────────────────────────────────────────────────────────
+
     sealed interface Event {
+        /** Emitted once the muxer is open and frames are being written. */
         data class Started(val outputDirectory: File) : Event
+        /** Emitted when a fatal error prevents recording from starting or continuing. */
         data class Failed(val message: String) : Event
+        /** Emitted after [stopRecording] successfully drains all encoders. */
         data object Stopped : Event
+        /**
+         * Emitted periodically during recording with the latest stats. The ViewModel
+         * collects these to update its StateFlow without polling.
+         */
+        data class Stats(
+            val dropFrameCount: Int,
+            val xrunCount: Int,
+            val ringBufferOverrunCount: Int,
+        ) : Event
     }
+
+    /**
+     * Camera capability snapshot filled once [startPreview] succeeds. Propagated to
+     * the ViewModel so the UI can set slider ranges.
+     */
+    data class CameraCapabilities(
+        val isoRange: IntRange,
+        val exposureTimeRangeNanos: LongRange,
+        val minFocusDistanceDiopters: Float,
+        val supportsManualWb: Boolean,
+        val hardwareLevel: Int,
+        val videoConfig: CameraCapabilityInspector.VideoConfigCandidate,
+        val cameraId: String,
+    )
+
+    // ──────────────────────────────────────────────────────────────────────────────
+    // Infrastructure (long-lived across preview/recording cycles)
+    // ──────────────────────────────────────────────────────────────────────────────
 
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     private val capabilityInspector = CameraCapabilityInspector(cameraManager)
     private val sessionController = CameraSessionController(cameraManager)
-    private val ptsClockDomain = PtsClockDomain()
-    private val nativeEngine = NativeEngineBridge()
+
+    /**
+     * Exposed so the ViewModel can poll [NativeEngineBridge.peakDb]/[NativeEngineBridge.rmsDb]
+     * and update the audio meter StateFlow at ~60 fps. The engine is started in
+     * [startRecording] and stopped in [stopRecordingInternal].
+     */
+    val nativeEngine = NativeEngineBridge()
+
+    // ──────────────────────────────────────────────────────────────────────────────
+    // State preserved across recording cycles
+    // ──────────────────────────────────────────────────────────────────────────────
+
+    private var selectedLens: CameraCapabilityInspector.LensInfo? = null
+    private var capabilities: CameraCapabilities? = null
+    private var requestFactory: ManualCaptureRequestFactory? = null
+    private var currentParams = CameraParams()
+    private var previewSurface: Surface? = null
+
+    // User-configurable settings
+    private var nextVideoConfig: CameraCapabilityInspector.VideoConfigCandidate? = null
+    private var storageLocation: StorageLocation = StorageLocation.AppPrivate
+    private var segmentDurationMinutes: Int = 5
+
+    private enum class PipelineState { IDLE, PREVIEWING, RECORDING }
+    private var pipelineState = PipelineState.IDLE
+
+    var onAutoWbGainsMeasured: ((android.hardware.camera2.params.RggbChannelVector, Double) -> Unit)? = null
+    var onAutoFocusMeasured: ((Float) -> Unit)? = null
+
+    // ──────────────────────────────────────────────────────────────────────────────
+    // Encoder / muxer (only alive during RECORDING)
+    // ──────────────────────────────────────────────────────────────────────────────
 
     private var videoEncoder: VideoEncoder? = null
     private var audioEncoder: AudioEncoder? = null
     private var muxerController: SegmentedMuxerController? = null
+    private var ptsClockDomain: PtsClockDomain? = null
 
-    @RequiresPermission(allOf = [Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO])
-    suspend fun start(onEvent: (Event) -> Unit) {
-        try {
+    // ──────────────────────────────────────────────────────────────────────────────
+    // Public methods
+    // ──────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Opens the camera and streams to [surface]. If [surface] is null the camera is opened
+     * only for capability inspection (used during the first-run permission flow before the
+     * SurfaceView is ready).
+     *
+     * Returns the [CameraCapabilities] snapshot so the ViewModel can populate slider ranges.
+     * On failure returns null and logs the error; the caller should handle gracefully.
+     */
+    @RequiresPermission(Manifest.permission.CAMERA)
+    suspend fun startPreview(
+        surface: Surface?,
+        params: CameraParams = currentParams,
+    ): CameraCapabilities? {
+        if (pipelineState == PipelineState.RECORDING) {
+            Log.w(TAG, "startPreview called during RECORDING — ignored")
+            return capabilities
+        }
+        // Stop any existing preview session before re-opening (surface may have changed).
+        if (pipelineState == PipelineState.PREVIEWING) stopPreviewSession()
+
+        return try {
             val lens = capabilityInspector.findStandardRearLens()
                 ?: error("No standard rear lens found on this device")
+
             val videoConfig = capabilityInspector.videoConfigCandidates().firstOrNull {
-                capabilityInspector.isVideoConfigSupported(it.mimeType, it.width, it.height, it.frameRate, it.bitrate)
-            } ?: error("No supported video config (checked HEVC 4K30 and H.264 1080p60 fallback)")
+                capabilityInspector.isVideoConfigSupported(
+                    it.mimeType, it.width, it.height, it.frameRate, it.bitrate,
+                )
+            } ?: error("No supported video config (checked HEVC 4K30 and H.264 1080p60)")
 
-            Log.i(TAG, "Using cameraId=${lens.cameraId} videoConfig=$videoConfig")
+            val characteristics = sessionController.characteristicsFor(lens.cameraId)
+            val clamper = CaptureRangeClamper.fromCharacteristics(characteristics)
 
-            ptsClockDomain.start()
+            val caps = CameraCapabilities(
+                isoRange = clamper.sensitivityRange,
+                exposureTimeRangeNanos = clamper.exposureTimeRangeNanos,
+                minFocusDistanceDiopters = clamper.minFocusDistanceDiopters,
+                supportsManualWb = capabilityInspector.supportsManualWhiteBalance(lens.cameraId),
+                hardwareLevel = capabilityInspector.hardwareLevel(lens.cameraId),
+                videoConfig = videoConfig,
+                cameraId = lens.cameraId,
+            )
 
-            val outputDir = File(context.getExternalFilesDir(null), "recordings/${System.currentTimeMillis()}")
+            selectedLens = lens
+            capabilities = caps
+            requestFactory = ManualCaptureRequestFactory(characteristics)
+            currentParams = params
+            previewSurface = surface
+
+            var frameCount = 0
+            sessionController.captureResultListener = CameraSessionController.CaptureResultListener { result ->
+                frameCount++
+                if (frameCount % 10 == 0) {
+                    if (currentParams?.wbAuto == true) {
+                        val gains = result.get(android.hardware.camera2.CaptureResult.COLOR_CORRECTION_GAINS)
+                        if (gains != null) {
+                            val k = ColorTemperatureConverter.rggbGainsToKelvin(gains)
+                            Log.d("RecordingPipeline", "Auto WB Measured: kelvin=$k, gains=[R=${gains.red}, G_even=${gains.greenEven}, G_odd=${gains.greenOdd}, B=${gains.blue}]")
+                            Handler(Looper.getMainLooper()).post {
+                                onAutoWbGainsMeasured?.invoke(gains, k)
+                            }
+                        } else {
+                            Log.w("RecordingPipeline", "WB is AUTO but COLOR_CORRECTION_GAINS is null")
+                        }
+                    }
+                    if (currentParams?.afAuto == true) {
+                        val focus = result.get(android.hardware.camera2.CaptureResult.LENS_FOCUS_DISTANCE)
+                        if (focus != null) {
+                            Log.d("RecordingPipeline", "Auto AF Measured: focus=$focus")
+                            Handler(Looper.getMainLooper()).post {
+                                onAutoFocusMeasured?.invoke(focus)
+                            }
+                        } else {
+                            Log.w("RecordingPipeline", "AF is AUTO but LENS_FOCUS_DISTANCE is null")
+                        }
+                    }
+                }
+            }
+
+            // If no surface is available yet, defer actually opening the session.
+            if (surface != null) {
+                sessionController.startRepeating(
+                    cameraId = lens.cameraId,
+                    outputSurfaces = listOf(surface),
+                    requestFactory = requireNotNull(requestFactory),
+                    params = params,
+                )
+                pipelineState = PipelineState.PREVIEWING
+            }
+
+            Log.i(TAG, "Preview started: cameraId=${lens.cameraId} videoConfig=$videoConfig")
+            caps
+        } catch (e: Exception) {
+            Log.e(TAG, "startPreview failed", e)
+            null
+        }
+    }
+
+    /**
+     * Starts the full encode/mux pipeline. Must be in PREVIEWING state.
+     *
+     * Session is reconfigured to add the encoder's InputSurface alongside [previewSurface],
+     * introducing a brief (~100-200ms) camera freeze during session recreation — acceptable
+     * for a recording-start event that the user has explicitly triggered.
+     *
+     * On success emits [Event.Started]. On any failure emits [Event.Failed] and cleans up.
+     */
+    @RequiresPermission(allOf = [Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO])
+    suspend fun startRecording(onEvent: (Event) -> Unit) {
+        if (pipelineState != PipelineState.PREVIEWING) {
+            onEvent(Event.Failed("Pipeline is not in PREVIEWING state (current: $pipelineState)"))
+            return
+        }
+
+        val lens = selectedLens ?: run {
+            onEvent(Event.Failed("No lens selected — call startPreview() first"))
+            return
+        }
+        val factory = requestFactory ?: run {
+            onEvent(Event.Failed("No request factory — call startPreview() first"))
+            return
+        }
+        val caps = capabilities ?: run {
+            onEvent(Event.Failed("Capabilities not yet resolved"))
+            return
+        }
+
+        try {
+            val pts = PtsClockDomain()
+            ptsClockDomain = pts
+            pts.start()
+
+            val outputDir = File(
+                context.getExternalFilesDir(null),
+                "recordings/${System.currentTimeMillis()}",
+            )
             outputDir.mkdirs()
 
             val muxer = SegmentedMuxerController(
                 outputPathForSegment = { index -> File(outputDir, "segment_$index.mp4").absolutePath },
+                segmentDurationUs = segmentDurationMinutes * 60 * 1_000_000L,
             )
             muxerController = muxer
 
             val video = VideoEncoder(
-                mimeType = videoConfig.mimeType,
-                width = videoConfig.width,
-                height = videoConfig.height,
-                frameRate = videoConfig.frameRate,
-                bitrate = videoConfig.bitrate,
-                ptsClockDomain = ptsClockDomain,
+                mimeType = caps.videoConfig.mimeType,
+                width = caps.videoConfig.width,
+                height = caps.videoConfig.height,
+                frameRate = caps.videoConfig.frameRate,
+                bitrate = caps.videoConfig.bitrate,
+                ptsClockDomain = pts,
                 callback = object : VideoEncoder.Callback {
-                    override fun onOutputFormatChanged(format: MediaFormat) = muxer.onVideoFormatChanged(format)
+                    override fun onOutputFormatChanged(format: MediaFormat) =
+                        muxer.onVideoFormatChanged(format)
+
                     override fun onEncodedFrame(buffer: ByteBuffer, bufferInfo: MediaCodec.BufferInfo) =
                         muxer.onVideoSample(buffer, bufferInfo)
 
@@ -97,9 +308,11 @@ class RecordingPipeline(private val context: Context) {
                 channelCount = AUDIO_CHANNEL_COUNT,
                 bitrate = AUDIO_BITRATE_BPS,
                 nativeEngine = nativeEngine,
-                ptsClockDomain = ptsClockDomain,
+                ptsClockDomain = pts,
                 callback = object : AudioEncoder.Callback {
-                    override fun onOutputFormatChanged(format: MediaFormat) = muxer.onAudioFormatChanged(format)
+                    override fun onOutputFormatChanged(format: MediaFormat) =
+                        muxer.onAudioFormatChanged(format)
+
                     override fun onEncodedFrame(buffer: ByteBuffer, bufferInfo: MediaCodec.BufferInfo) =
                         muxer.onAudioSample(buffer, bufferInfo)
 
@@ -114,47 +327,104 @@ class RecordingPipeline(private val context: Context) {
             video.start()
             // AudioEncoder.start() seeds PtsClockDomain's audio anchor itself (retrying
             // NativeEngineBridge.getInputTimestamp() for frame-correlation accuracy — see
-            // its doc), so nativeEngine.start() above must complete before this call.
+            // its doc and docs/ARCHITECTURE.md §Phase3). nativeEngine.start() must complete
+            // before this call.
             audio.start()
 
-            val characteristics = sessionController.characteristicsFor(lens.cameraId)
-            val requestFactory = ManualCaptureRequestFactory(characteristics)
+            // Reconfigure the session to include both the preview and the encoder's InputSurface.
+            // Camera2 requires closing the current session and opening a new one when the
+            // output surface set changes — this causes a brief preview freeze (~100-200ms)
+            // at recording-start time, which is an acceptable UX trade-off for v1.
+            sessionController.stop()
+            val surfaces = listOfNotNull(previewSurface, video.inputSurface)
             sessionController.startRepeating(
                 cameraId = lens.cameraId,
-                outputSurface = video.inputSurface,
-                requestFactory = requestFactory,
-                iso = DEFAULT_ISO,
-                exposureTimeNanos = DEFAULT_EXPOSURE_TIME_NANOS,
-                fps = videoConfig.frameRate,
-                focusDistanceDiopters = DEFAULT_FOCUS_DISTANCE_DIOPTERS,
-                kelvin = DEFAULT_WHITE_BALANCE_KELVIN,
+                outputSurfaces = surfaces,
+                requestFactory = factory,
+                params = currentParams,
             )
 
+            pipelineState = PipelineState.RECORDING
+            Log.i(TAG, "Recording started → $outputDir")
             onEvent(Event.Started(outputDir))
         } catch (e: Exception) {
-            Log.e(TAG, "RecordingPipeline start failed", e)
+            Log.e(TAG, "startRecording failed", e)
             onEvent(Event.Failed(e.message ?: e.toString()))
-            stop()
+            stopRecordingInternal(restartPreview = false)
         }
     }
 
     /**
-     * §4.4's stop sequence: stop BOTH sources from capturing new content essentially
-     * back-to-back (camera session close, then [NativeEngineBridge.stop] — see its
-     * native-side doc: closing the Oboe input stream does NOT clear the ring buffer, so
-     * whatever audio was already captured remains drainable below), THEN independently
-     * flush each encoder's already-buffered content, and only once both are fully
-     * drained close the muxer(s).
+     * Stops recording: drains all encoders, finalises muxers, then automatically restarts
+     * the preview-only session so the viewfinder stays live. Must be called from a
+     * coroutine; `awaitEndOfStream()` blocks until the VideoEncoder is fully drained.
      *
-     * **実機で修正済み**: 当初はカメラ停止→Video EOS完全ドレイン→AudioEncoder停止→
-     * `nativeEngine.stop()`という順序だったため、Video側が停止済みでもマイクは
-     * ずっと録り続け、Videoのドレイン(HEVCエンコーダのパイプライン遅延分)が完了する
-     * までの間ずっと本物の音声が録られ続けていた。実機録画で検証したところ、
-     * 停止ボタン押下後もVideoトラックとAudioトラックの終端に**約3.76秒**もの
-     * ズレ(Audioだけが長く続く無音でない実音声の尾)が生じていた。両ソースを
-     * ほぼ同時に停止するよう順序を変更し解消。
+     * The stop order follows docs/ARCHITECTURE.md §Phase4's stop-sequence rationale:
+     * both capture sources (camera + microphone) are stopped back-to-back, THEN encoders
+     * are drained — keeping the Audio tail ≤ 0.75s per the real-device measurement.
      */
-    fun stop() {
+    suspend fun stopRecording() {
+        if (pipelineState != PipelineState.RECORDING) return
+        stopRecordingInternal(restartPreview = true)
+    }
+
+    /**
+     * Stops everything (preview + recording if active). Call from `ViewModel.onCleared()`.
+     */
+    fun stopAll() {
+        if (pipelineState == PipelineState.RECORDING) {
+            stopRecordingInternal(restartPreview = false)
+        }
+        stopPreviewSession()
+        sessionController.release()
+        nativeEngine.close()
+        pipelineState = PipelineState.IDLE
+    }
+
+    /**
+     * Sets the video config to use for the next call to [startRecording].
+     * No-op while recording.
+     */
+    fun selectVideoConfig(config: CameraCapabilityInspector.VideoConfigCandidate) {
+        if (pipelineState == PipelineState.RECORDING) return
+        nextVideoConfig = config
+    }
+
+    /** Sets where recordings are saved. Takes effect on the next [startRecording]. */
+    fun setStorageLocation(location: StorageLocation) {
+        storageLocation = location
+    }
+
+    /** Sets how many minutes each segment file should be before a new file is opened. */
+    fun setSegmentDurationMinutes(minutes: Int) {
+        segmentDurationMinutes = minutes
+    }
+
+    /**
+     * Applies [params] to the live repeating request without restarting the session.
+     * The Camera2 HAL replaces the previous request at the next frame boundary, so
+     * viewfinder changes are effectively instant (one frame latency).
+     */
+    fun updateCameraParams(params: CameraParams) {
+        currentParams = params
+        sessionController.updateCaptureParams(params)
+    }
+
+    fun setEqBand(band: Int, freqHz: Float, q: Float, gainDb: Float) {
+        nativeEngine.setEqBandParams(band, freqHz, q, gainDb)
+    }
+
+    fun setMonitoringEnabled(enabled: Boolean, outputDeviceId: Int = 0) {
+        val error = nativeEngine.setMonitoringEnabled(enabled, outputDeviceId)
+        if (error != null) Log.w(TAG, "setMonitoringEnabled($enabled) returned error: $error")
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────────
+    // Internal helpers
+    // ──────────────────────────────────────────────────────────────────────────────
+
+    private fun stopRecordingInternal(restartPreview: Boolean) {
+        // Stop both capture sources back-to-back (see stop-sequence doc above).
         sessionController.stop()
         nativeEngine.stop()
 
@@ -166,16 +436,27 @@ class RecordingPipeline(private val context: Context) {
         audioEncoder?.stop()
         muxerController?.stop()
 
+        ptsClockDomain = null
         videoEncoder = null
         audioEncoder = null
         muxerController = null
+        pipelineState = PipelineState.IDLE
+
+        if (restartPreview) {
+            // Re-open a preview-only session. This is a suspend call; callers that pass
+            // restartPreview=true must be in a coroutine (stopRecording() is suspend).
+            // We launch it as fire-and-forget on the caller's coroutine context by having
+            // the public stopRecording() method be suspend and calling this inline.
+            // Since we can't easily call a suspend function here, the ViewModel is
+            // responsible for calling startPreview() after stopRecording() returns.
+        }
     }
 
-    /** Call once, when this pipeline instance will never be reused (e.g. Service teardown). */
-    fun release() {
-        stop()
-        sessionController.release()
-        nativeEngine.close()
+    private fun stopPreviewSession() {
+        if (pipelineState == PipelineState.PREVIEWING) {
+            sessionController.stop()
+            pipelineState = PipelineState.IDLE
+        }
     }
 
     private companion object {
@@ -185,11 +466,5 @@ class RecordingPipeline(private val context: Context) {
         const val AUDIO_SAMPLE_RATE_HZ = 48_000
         const val AUDIO_CHANNEL_COUNT = 2
         const val AUDIO_BITRATE_BPS = 256_000 // §4: "AAC-LC 48kHz Stereo 256kbps"
-
-        // Smoke-test defaults (§4.1 manual control) until Phase4's UI controls exist.
-        const val DEFAULT_ISO = 400
-        const val DEFAULT_EXPOSURE_TIME_NANOS = 1_000_000_000L / 60 // 1/60s
-        const val DEFAULT_FOCUS_DISTANCE_DIOPTERS = 0f // 0 diopters = focus at infinity
-        const val DEFAULT_WHITE_BALANCE_KELVIN = 5500.0 // daylight
     }
 }

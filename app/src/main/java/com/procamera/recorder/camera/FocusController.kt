@@ -80,7 +80,7 @@ class FocusController(
     private fun lockFocusAndNotify(focusDistanceDiopters: Float) {
         stateMachine.reset()
         requestSubmitter.submitSingleRequest { builder ->
-            captureRequestFactory.applyManualFocusLocked(builder, focusDistanceDiopters)
+            captureRequestFactory.applyFocus(builder, focusDistanceDiopters, afAuto = false)
         }
         onFocusLocked(focusDistanceDiopters)
     }

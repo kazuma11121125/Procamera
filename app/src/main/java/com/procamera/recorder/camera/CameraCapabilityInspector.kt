@@ -195,6 +195,137 @@ class CameraCapabilityInspector(private val cameraManager: CameraManager) {
         return hasAwbOff && hasManualPostProcessing
     }
 
+    // -----------------------------------------------------------------------------------------
+    // Multi-lens enumeration (added for lens-switcher UI)
+    // -----------------------------------------------------------------------------------------
+
+    /**
+     * Represents a single rear-facing physical (or logical-multi) camera available on
+     * this device, enriched with the metadata the lens-switcher UI and zoom controller
+     * need at startup.
+     *
+     * [equivalentFocalLengthMm] is the 35mm-film-equivalent focal length computed via
+     * the same formula used in [findStandardRearLens]: `physicalFocalLength × (43.27 /
+     * sensorDiagonalMm)`.  [zoomLabel] is derived from `equivalentFocalLengthMm / 28`
+     * and formatted as "0.6x", "1x", "2x", etc. (see [allRearLenses] for rounding
+     * rules).  [maxDigitalZoom] is read directly from
+     * `SCALER_AVAILABLE_MAX_DIGITAL_ZOOM` — defaulting to 1f if absent — and caps the
+     * zoom range that the pinch-to-zoom gesture exposes for this lens.
+     */
+    data class AvailableLens(
+        val cameraId: String,
+        val equivalentFocalLengthMm: Float,
+        val zoomLabel: String,         // e.g. "0.6x", "1x", "2x"
+        val isStandardLens: Boolean,
+        val hardwareLevel: Int,
+        val maxDigitalZoom: Float,     // from SCALER_AVAILABLE_MAX_DIGITAL_ZOOM
+        val sensorDiagonalMm: Float,
+    )
+
+    /**
+     * Enumerates **all** rear-facing cameras whose sensor diagonal meets the plausibility
+     * floor ([MIN_PLAUSIBLE_MAIN_SENSOR_DIAGONAL_MM]), sorted by 35mm-equivalent focal
+     * length ascending (ultra-wide → standard → telephoto).
+     *
+     * This is the source of truth for the lens-switcher strip: the UI renders one button
+     * per element, highlights [AvailableLens.isStandardLens], and uses
+     * [AvailableLens.zoomLabel] as the button label.
+     *
+     * **zoom-label rounding rules**
+     * - ratio < (1.0 − 0.15) → "%.1fx" (one decimal, e.g. "0.6x")
+     * - |ratio − 1.0| ≤ 0.15 → "1x"  (exact label, no decimal)
+     * - ratio > (1.0 + 0.15) → "%.0fx" (no decimal, e.g. "2x", "5x")
+     *
+     * where `ratio = equivalentFocalLengthMm / 28.0`.
+     */
+    fun allRearLenses(): List<AvailableLens> {
+        val standardCameraId = findStandardRearLens()?.cameraId
+
+        return cameraManager.cameraIdList.mapNotNull { id ->
+            val characteristics = cameraManager.getCameraCharacteristics(id)
+            val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
+            if (facing != CameraCharacteristics.LENS_FACING_BACK) return@mapNotNull null
+
+            val focalLengths = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+            val sensorSize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+            val focalLength = focalLengths?.minOrNull()
+            if (focalLength == null || sensorSize == null) return@mapNotNull null
+
+            // Same formula as findStandardRearLens: 35mm-equivalent = focal × (43.27 / diagonal)
+            val sensorDiagonalMm = kotlin.math.hypot(sensorSize.width, sensorSize.height)
+            if (sensorDiagonalMm < MIN_PLAUSIBLE_MAIN_SENSOR_DIAGONAL_MM) return@mapNotNull null
+
+            val equivalentFocalLengthMm = focalLength * (FULL_FRAME_DIAGONAL_MM / sensorDiagonalMm)
+
+            val ratio = equivalentFocalLengthMm / NORMAL_LENS_EQUIVALENT_MM
+            val zoomLabel = when {
+                ratio < 0.85f -> "%.1fx".format(ratio)  // ultra-wide, e.g. "0.6x"
+                ratio <= 1.15f -> "1x"                   // within ±15% of 28mm → "1x"
+                else -> "%.0fx".format(ratio)            // telephoto, e.g. "2x", "5x"
+            }
+
+            AvailableLens(
+                cameraId = id,
+                equivalentFocalLengthMm = equivalentFocalLengthMm,
+                zoomLabel = zoomLabel,
+                isStandardLens = id == standardCameraId,
+                hardwareLevel = hardwareLevel(id),
+                maxDigitalZoom = maxDigitalZoom(id),
+                sensorDiagonalMm = sensorDiagonalMm,
+            )
+        }.sortedBy { it.equivalentFocalLengthMm }
+    }
+
+    /**
+     * Returns every [VideoConfigCandidate] from the full candidate list that
+     * [isVideoConfigSupported] confirms is actually encodable on this device, sorted
+     * by descending pixel count (4K before 1080p, 1080p60 before 1080p30, etc.).
+     *
+     * The full candidate set checked (superset of [videoConfigCandidates]):
+     * - HEVC 4K 3840×2160 30fps 50 Mbps
+     * - HEVC 4K 3840×2160 24fps 40 Mbps
+     * - AVC 1080p 1920×1080 60fps 20 Mbps
+     * - AVC 1080p 1920×1080 30fps 10 Mbps
+     * - AVC 720p 1280×720  60fps  8 Mbps
+     *
+     * [cameraId] is accepted as a parameter for future use (e.g. per-camera codec
+     * capability queries via `CameraCharacteristics`) but the current implementation
+     * delegates entirely to the device-global [isVideoConfigSupported] check, which is
+     * correct for MediaCodec availability.
+     */
+    @Suppress("UNUSED_PARAMETER") // cameraId reserved for future per-camera codec queries
+    fun supportedVideoConfigs(cameraId: String): List<VideoConfigCandidate> {
+        val allCandidates = listOf(
+            VideoConfigCandidate(MediaFormat.MIMETYPE_VIDEO_HEVC, 3840, 2160, 30, 50_000_000), // 16:9
+            VideoConfigCandidate(MediaFormat.MIMETYPE_VIDEO_HEVC, 3840, 2880, 30, 50_000_000), // 4:3
+            VideoConfigCandidate(MediaFormat.MIMETYPE_VIDEO_AVC,  2560, 1080, 30, 20_000_000), // 21:9
+            VideoConfigCandidate(MediaFormat.MIMETYPE_VIDEO_AVC,  1920, 1080, 60, 20_000_000), // 16:9
+            VideoConfigCandidate(MediaFormat.MIMETYPE_VIDEO_AVC,  1920, 1080, 30, 10_000_000), // 16:9
+            VideoConfigCandidate(MediaFormat.MIMETYPE_VIDEO_AVC,  1440, 1080, 30, 10_000_000), // 4:3
+            VideoConfigCandidate(MediaFormat.MIMETYPE_VIDEO_AVC,  1080, 1080, 30,  8_000_000), // 1:1
+            VideoConfigCandidate(MediaFormat.MIMETYPE_VIDEO_AVC,  1280,  720, 60,  8_000_000), // 16:9
+        )
+        return allCandidates
+            .filter { c ->
+                isVideoConfigSupported(c.mimeType, c.width, c.height, c.frameRate, c.bitrate)
+            }
+            .sortedByDescending { it.width * it.height }
+    }
+
+    /**
+     * Reads `SCALER_AVAILABLE_MAX_DIGITAL_ZOOM` for [cameraId], returning 1f if the
+     * characteristic is absent (meaning no digital zoom beyond 1× is advertised).
+     *
+     * This value caps the zoom ratio exposed by the pinch-to-zoom gesture for this
+     * physical lens. The camera2 API contract guarantees the crop region covers the full
+     * sensor at ratio 1× and is cropped down to `1 / maxDigitalZoom` of the sensor at
+     * the maximum zoom level.
+     */
+    fun maxDigitalZoom(cameraId: String): Float {
+        val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+        return characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
+    }
+
     private companion object {
         const val FULL_FRAME_DIAGONAL_MM = 43.27f
         const val NORMAL_LENS_EQUIVALENT_MM = 28f // typical rear "main" lens equivalent on phones

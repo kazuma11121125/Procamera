@@ -1,5 +1,6 @@
 package com.procamera.recorder.camera
 
+import android.graphics.Rect
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
@@ -11,45 +12,52 @@ import android.hardware.camera2.params.MeteringRectangle
  * touch-to-focus) onto a real `CaptureRequest.Builder`. Pure range-clamping math lives in
  * [CaptureRangeClamper] (unit-tested); this class is the untested framework-facing glue
  * that calls `.set(...)` — Camera2's Builder can only be constructed from a real
- * CameraDevice, so this can't be exercised by a plain JUnit host test (would need
- * Robolectric or an instrumented test, tracked for Phase 5).
+ * CameraDevice, so this can't be exercised by a plain JUnit host test.
+ *
+ * Phase 4 UI additions:
+ * - [applyWhiteBalance]: replaced the old `applyManualWhiteBalance(kelvin)` with a unified
+ *   method that switches between Auto AWB and manual Kelvin depending on [CameraParams.wbAuto].
+ *   デフォルトはオートWB — Kelvin→RGGBゲインはセンサー固有の分光感度に依存するため
+ *   デバイス非依存の近似変換は必ずズレが生じる。オートを選べば ISP が適切に補正する。
+ * - [applyZoom]: デジタルズームを SCALER_CROP_REGION で実装(API 29 互換)。
  */
 class ManualCaptureRequestFactory(
     private val characteristics: CameraCharacteristics,
     val rangeClamper: CaptureRangeClamper = CaptureRangeClamper.fromCharacteristics(characteristics),
 ) {
-    // No single "supported frame duration range" key exists at the sensor level in a
-    // stream-independent way (it's per-format/resolution, via
-    // StreamConfigurationMap.getOutputMinFrameDuration). §4.1's FPS presets (24-60
-    // typical) are comfortably within any FULL-level sensor's capability, so a generous
-    // static bound is used here; the actual per-resolution/format ceiling is separately
-    // validated by CameraCapabilityInspector.isVideoConfigSupported() before this
-    // factory's fps is ever chosen.
+    // Active array size — needed to compute the crop region for digital zoom.
+    private val activeArray: Rect? =
+        characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+
+    /** Max digital zoom supported (1.0 if unknown). */
+    val maxDigitalZoom: Float =
+        characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
+
     val frameDurationRangeNanos: LongRange = 4_000_000L..1_000_000_000L
 
     fun applyManualExposure(builder: CaptureRequest.Builder, iso: Int, exposureTimeNanos: Long, fps: Int) {
-        builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_OFF)
+        builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
         builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
         builder.set(CaptureRequest.SENSOR_SENSITIVITY, rangeClamper.clampSensitivity(iso))
         builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, rangeClamper.clampExposureTimeNanos(exposureTimeNanos))
-        // §4.1: FPS is fixed via SENSOR_FRAME_DURATION (the documented correct approach
-        // when AE is OFF), not CONTROL_AE_TARGET_FPS_RANGE.
         builder.set(
             CaptureRequest.SENSOR_FRAME_DURATION,
             rangeClamper.frameDurationNanosForFps(fps, frameDurationRangeNanos),
         )
     }
 
-    /** Base state (§4.1): MF locked at a fixed distance, no AF scanning. */
-    fun applyManualFocusLocked(builder: CaptureRequest.Builder, focusDistanceDiopters: Float) {
-        builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
-        builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, rangeClamper.clampFocusDistance(focusDistanceDiopters))
+    /** Base state (§4.1): MF locked at a fixed distance or continuous video AF. */
+    fun applyFocus(builder: CaptureRequest.Builder, focusDistanceDiopters: Float, afAuto: Boolean) {
+        if (afAuto) {
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+        } else {
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+            builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, rangeClamper.clampFocusDistance(focusDistanceDiopters))
+        }
     }
 
     /**
-     * Temporary state during a tap-to-focus gesture (§4.1's hybrid mechanism): AF_MODE
-     * switches to AUTO with a metering region and an explicit trigger. [FocusController]
-     * owns switching back to [applyManualFocusLocked] once AF converges.
+     * Temporary state during a tap-to-focus gesture (§4.1's hybrid mechanism).
      */
     fun applyTapToFocusTrigger(builder: CaptureRequest.Builder, region: MeteringRectangle) {
         builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
@@ -57,17 +65,70 @@ class ManualCaptureRequestFactory(
         builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
     }
 
-    fun applyManualWhiteBalance(builder: CaptureRequest.Builder, kelvin: Double) {
+    /**
+     * White balance — Auto or Manual Kelvin.
+     *
+     * **Auto mode** ([wbAuto]=true, デフォルト):
+     *   Sets `CONTROL_AWB_MODE_CONTINUOUS_AUTO_PICTURE`. The ISP handles colour correction
+     *   using its sensor-specific calibration data. This is always more accurate than our
+     *   Tanner Helland approximation on a device we haven't calibrated against.
+     *
+     * **Manual mode** ([wbAuto]=false):
+     *   Sets `CONTROL_AWB_MODE_OFF` and applies Kelvin→RGGB via [ColorTemperatureConverter].
+     *   Note: the gains are an approximation. Accuracy varies by sensor.
+     *   `supportsManualWb` gate must be checked before exposing this in the UI (Sony SO-51C
+     *   supports MANUAL_POST_PROCESSING per [CameraCapabilityInspector.supportsManualWhiteBalance]).
+     */
+    fun applyWhiteBalance(builder: CaptureRequest.Builder, params: CameraParams) {
+        if (params.wbAuto) {
+            builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+            return
+        }
         builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
         builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
-        builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, ColorTemperatureConverter.kelvinToRggbGains(kelvin))
+        val gains = params.manualWbGains ?: ColorTemperatureConverter.kelvinToRggbGains(params.kelvin)
+        builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, gains)
         builder.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, IDENTITY_COLOR_TRANSFORM)
     }
 
+    /**
+     * Digital zoom via `SCALER_CROP_REGION` (API 29 compatible).
+     *
+     * Crops the centre of the active array to `1/zoomRatio` of its original area.
+     * The aspect ratio of the active array is preserved automatically by dividing both
+     * width and height by the same factor.
+     *
+     * Camera2 HAL scales the cropped region back to the full output resolution, giving the
+     * appearance of zoom. Quality degrades beyond [maxDigitalZoom] (ISP upscale limit).
+     *
+     * No-op when [zoomRatio] ≤ 1.0 (clearing the crop region restores 1:1 mapping).
+     */
+    fun applyZoom(builder: CaptureRequest.Builder, zoomRatio: Float) {
+        val array = activeArray ?: return
+        val clamped = zoomRatio.coerceIn(1f, maxDigitalZoom)
+        if (clamped <= 1.0f) {
+            // Restore full sensor area — explicitly clear any previous crop.
+            builder.set(CaptureRequest.SCALER_CROP_REGION, array)
+            return
+        }
+        val cropWidth = (array.width() / clamped).toInt()
+        val cropHeight = (array.height() / clamped).toInt()
+        val left = array.left + (array.width() - cropWidth) / 2
+        val top = array.top + (array.height() - cropHeight) / 2
+        builder.set(
+            CaptureRequest.SCALER_CROP_REGION,
+            Rect(left, top, left + cropWidth, top + cropHeight),
+        )
+    }
+
+    // Keep the old method name as a bridge (called from CameraSessionController.buildRequest
+    // which was written before the wbAuto param was added — updated in this commit).
+    @Deprecated("Use applyWhiteBalance(builder, params)", ReplaceWith("applyWhiteBalance(builder, CameraParams(kelvin = kelvin, wbAuto = false))"))
+    fun applyManualWhiteBalance(builder: CaptureRequest.Builder, kelvin: Double) {
+        applyWhiteBalance(builder, CameraParams(kelvin = kelvin, wbAuto = false))
+    }
+
     companion object {
-        // 3x3 identity matrix as 9 Rationals (numerator, denominator pairs), row-major —
-        // COLOR_CORRECTION_TRANSFORM's required layout. Paired with COLOR_CORRECTION_GAINS
-        // doing all the actual WB correction, this transform intentionally does nothing.
         private val IDENTITY_COLOR_TRANSFORM = ColorSpaceTransform(
             intArrayOf(
                 1, 1, 0, 1, 0, 1,

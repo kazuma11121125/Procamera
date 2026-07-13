@@ -154,6 +154,40 @@ advisorから「`seedAudioAnchor()`が実際にフレーム相関に成功して
 
 3回とも符号が一定せず(音声が先行/映像が先行の両方が現れている)、systematicなドリフトの兆候はなく、いずれも±20ms予算内に収まった。**確信度の明示**: このクリップは被写体(手)がレンズに極端に近くモーションブラーが強いため、目視で「接触の瞬間」を1フレームに確定できず、音声オンセットに最も近い映像フレームのPTSを機械的な近傍探索で採用した——真の接触フレームが隣のフレームだった場合、実際の差分は最大で1フレーム分(約33ms)ずれる可能性が残る。また30fpsの映像フレーム間隔(33.3ms)自体が測定分解能の下限であり、±20ms予算に対してこの検証方法の分解能はぎりぎりである。**Phase5では、被写体をレンズから離して両手全体をフレーム内に収めた明瞭な拍手、またはトーチ発光のような単一フレームで判別可能な視覚イベントでの再検証が望ましい**。それでも、旧バグ(数百ms〜秒単位でズレる)や停止シーケンスのバグとは性質が全く異なる「せいぜい1フレーム程度の誤差」に収まっていることは、Video PTSクロックドメイン修正の正しさを実データで裏付ける結果と言える。
 
+### Phase 4 UI 実装完了(2026-07-14)
+
+スモークテストマイルストーン(上記)の検証後、§4.5/§4.6 の本格 UI を実装した。
+
+**追加・変更ファイル:**
+
+| ファイル | 変更内容 |
+|---|---|
+| `camera/CameraParams.kt` | カメラパラメータの不変データクラス(新規) |
+| `camera/CameraSessionController.kt` | `List<Surface>` 対応 + `updateCaptureParams()` ライブ更新 |
+| `pipeline/RecordingPipeline.kt` | IDLE→PREVIEWING→RECORDING 状態機械に拡張。`startPreview()` / `startRecording()` / `stopRecording()` を分離。`nativeEngine` を `val` で公開 |
+| `ui/viewmodel/CameraUiState.kt` | 全 UI State の data class(新規) |
+| `ui/viewmodel/CameraControlViewModel.kt` | `AndroidViewModel` — 60fps メーターポーリング、タイマー、ストレージ監視コルーチン(新規) |
+| `ui/theme/ProCameraTheme.kt` | プロカメラ用ダークテーマ(新規) |
+| `ui/components/PreviewSurfaceView.kt` | `SurfaceView` Compose ラッパー(新規) |
+| `ui/components/AudioMeterBar.kt` | Canvas dBFS メーター(新規) |
+| `ui/components/ManualControlSlider.kt` | ISO/シャッター/フォーカス/WB スライダー(新規) |
+| `ui/MainScreen.kt` | 完全カメラ UI(新規) |
+| `ui/MainActivity.kt` | 権限フロー完全実装 + `FLAG_KEEP_SCREEN_ON` + エッジトゥエッジ(書き換え) |
+
+**設計判断:**
+
+- **CameraSessionController の `List<Surface>` 化**: Camera2 は Surface セット変更のたびにセッション再作成が必要。Preview→Recording 移行時は意図的にセッションを閉じて再作成する(~100-200ms の一時停止は録画開始の UX として許容)。
+- **ViewModel の `nativeEngine.peakDb()` 16ms ポーリング**: §4.5 の「Choreographer で約60fps ポーリング(JNI push ではなく pull)」に準拠。Audio コールバックスレッドからの JNI 呼び出し禁止(§4.2)と整合。
+- **`IsoSlider` の対数スケール**: ISO は知覚的に対数均等(ISO を2倍 = 1EV)なため、線形スケールのスライダーは低域が粗くなりすぎる。`ln()` で正規化し、一般的な ISO 停止値(50, 100, 200...) にスナップ。
+- **`ShutterSlider` の対数スケール**: 同上。§4.1 の LED-PWM 回避プリセット(1/50, 1/60, 1/100, 1/120)はワンタップボタン行として別出し。
+- **`SecondaryTabRow`**: `TabRow` は Compose BOM 2026.06.01 時点で deprecated。`SecondaryTabRow` を使用。
+
+**実機確認待ち事項:**
+
+- プレビュー→録画セッション切り替え時の実際の映像凍結時間(Sony SO-51C で計測)
+- `PreviewSurfaceView` の `aspectRatio = 9f/16f` が実機センサーと一致するか(センサー方向依存)
+- 60fps メーターポーリングの CPU 占有率が許容範囲内か
+
 ---
 
 ## 採用バージョン一覧(2026-07-13 時点で実在確認済み)

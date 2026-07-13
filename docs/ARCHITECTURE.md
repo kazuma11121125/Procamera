@@ -89,6 +89,24 @@ Tanner Hellandの黒体放射近似式でKelvin→RGB変換し、補正ゲイン
 
 **この実機で確認できた実データ**(Phase5の実機検証手順に転記予定): `SENSOR_INFO_TIMESTAMP_SOURCE=REALTIME`(この端末ではUNKNOWN較正パスは検証不可、別端末が必要)、背面メインカメラは`INFO_SUPPORTED_HARDWARE_LEVEL_FULL`かつ`COLOR_CORRECTION_MODE_TRANSFORM_MATRIX`対応、3840x2160@30fps HEVC 50Mbpsおよび1920x1080@60fps H.264 20Mbps両方とも`MediaCodecList`上でサポート確認済み。
 
+### FocusController・タップtoフォーカス(§4.1)
+
+`TapToMeteringRegion`(タップ座標→センサー座標のマッピング、センサー回転補正含む)と`TapToFocusStateMachine`(AF_STATE遷移の純粋な状態機械: Scanning→Converged/TimedOut)を、実際の`CaptureRequest.Builder`/`CaptureResult`(フレームワーク依存でJUnitから直接は使えない)から分離してテスト可能にした。`FocusController`はこれらとカメラセッションへの実送信を`RequestSubmitter`インターフェース経由で束ねる、Phase4で実装するセッション管理クラスとの結合点。JUnit 13ケース。
+
+### AudioEncoder・PcmDither(§4.2/§4.4)
+
+Float32→16bit変換にTPDFディザ(2つの独立一様乱数の和)を実装。JUnitで無音時のディザノイズ床、フルスケール入力のクランプ(オーバーフロー・ラップアラウンドしないこと)、微小信号でのディザによる値のばらつき(単純丸めでは同じ値に潰れるはずの信号が複数の量子化値にまたがることを確認)を検証。JUnit 6ケース。
+
+`VideoEncoder`(InputSurface非同期モード、出力側で`PtsClockDomain.normalizeVideoPtsUs`を適用)と`AudioEncoder`(専用ドレインスレッド、同期API、`PcmDither`→`queueInputBuffer`)を実装。いずれも実際のMediaCodecインスタンス・実行中のパイプラインが必要なため、**コンパイル検証のみでJUnit化していない**(Phase4でCamera2セッション・Serviceと結線してから実機で検証する)。
+
+### SegmentedMuxerController(§4.4)
+
+セグメント切替の「いつ」を決める`SegmentRotationPlanner`(ビデオPTS+キーフレーム境界のみに依存する純粋ロジック)を切り出し、5分デフォルト境界での切替タイミング・キーフレーム以外での非切替・複数回転・30fpsストリームでのシミュレーション等をJUnit 7ケースで検証。
+
+実際のMediaMuxerライフサイクル管理(`SegmentedMuxerController`)は未テストのフレームワーク結線コードだが、実装中に**自己発見して修正したバグが1件ある**: 当初、ローテーション境界より前のPTSを持つ「遅れて到着したサンプル」(Video/Audioが別スレッドで動くため、片方のスレッドが境界通過を検知して新Muxerに切り替えた直後、もう片方のスレッドではまだ境界より前のサンプルが処理待ちのことがある)を、誤って新しいMuxerに書き込んでしまう分岐漏れがあった。境界PTSとの比較による明示的な振り分け(`routeDuringRotation`)に修正。
+
+**確信度の明示 / 既知の限界**: Video/Audio両トラックを同一境界で完全にサンプル欠落・重複なく切り替えるには、2つの独立したスレッド間の緊密な同期が本質的に必要であり、本実装は境界PTS比較+「新セグメントへN個書き込まれたら旧Muxerを閉じる」というヒューリスティックな猶予機構に留まる。これはコンパイルやホスト単体テストでは検証しきれない、実機でのマルチスレッドタイミングに依存する正しさであり、**Phase5の実機検証で複数回のセグメント境界を跨ぐ連続録画を行い、各セグメントファイルの先頭・末尾にA/Vギャップや重複フレームが無いことを個別に確認する必要がある**、と明記した。
+
 ---
 
 ## 採用バージョン一覧(2026-07-13 時点で実在確認済み)

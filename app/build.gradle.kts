@@ -68,10 +68,6 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    // NOTE: AGP 9 built-in Kotlin derives the Kotlin jvmTarget from `compileOptions` above;
-    // no separate kotlinOptions/compilerOptions block is exposed on this AGP/KGP pairing
-    // (attempting `android.compilerOptions {}` here fails to resolve — see 前提・判断ログ).
-
     buildFeatures {
         compose = true
         prefab = true // required to consume Oboe's prefab (CMake find_package) package
@@ -81,6 +77,12 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
     }
 }
 

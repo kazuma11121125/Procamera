@@ -83,10 +83,22 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
     @androidx.annotation.RequiresPermission(Manifest.permission.CAMERA)
     internal fun attachPreviewSurface(surface: Surface) {
         previewSurface = surface
-        _uiState.update { it.copy(recordingState = RecordingUiState.StartingPreview) }
+        val wasRecording = _uiState.value.isRecording
+        if (!wasRecording) {
+            _uiState.update { it.copy(recordingState = RecordingUiState.StartingPreview) }
+        }
         viewModelScope.launch {
             val params = _uiState.value.toCameraParams()
             val caps = pipeline.startPreview(surface, params)
+            if (wasRecording) {
+                // A recording was already in progress — this is the viewfinder returning
+                // after [detachPreviewSurface] dropped to an encoder-only session (§4.6
+                // screen-off survival). pipeline.startPreview() already folded the surface
+                // back into the live session (or logged a failure); recordingState stays
+                // Recording either way — only refresh capabilities if they came back.
+                if (caps != null) _uiState.update { it.copy(capabilities = caps, errorMessage = null) }
+                return@launch
+            }
             if (caps != null) {
                 // Enumerate lenses for the lens selector.
                 val allLenses = try { capabilityInspector.allRearLenses() } catch (e: Exception) { emptyList() }
@@ -122,9 +134,20 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    @androidx.annotation.RequiresPermission(Manifest.permission.CAMERA)
     internal fun detachPreviewSurface() {
         previewSurface = null
-        _uiState.update { it.copy(recordingState = RecordingUiState.Idle) }
+        val wasRecording = _uiState.value.isRecording
+        viewModelScope.launch {
+            // If a recording is in progress, pipeline.detachPreviewSurface() reconfigures
+            // the live session to the encoder's InputSurface alone so recording keeps
+            // going without a preview consumer (§4.6) — recordingState stays Recording;
+            // only the viewfinder is gone until attachPreviewSurface() reattaches it.
+            pipeline.detachPreviewSurface()
+            if (!wasRecording) {
+                _uiState.update { it.copy(recordingState = RecordingUiState.Idle) }
+            }
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -204,12 +227,14 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
                             )
                         }
                         startRecordingJobs()
+                        startRecordingService()
                     }
                     is RecordingPipeline.Event.Failed -> {
                         _uiState.update {
                             it.copy(recordingState = RecordingUiState.Previewing, errorMessage = "録画エラー: ${event.message}")
                         }
                         stopRecordingJobs()
+                        stopRecordingService()
                     }
                     RecordingPipeline.Event.Stopped -> {}
                     is RecordingPipeline.Event.Stats -> {
@@ -227,6 +252,7 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             stopRecordingJobs()
             pipeline.stopRecording()
+            stopRecordingService()
             val surface = previewSurface
             if (surface != null) {
                 val caps = pipeline.startPreview(surface, _uiState.value.toCameraParams())
@@ -380,6 +406,24 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * Starts [RecordingService] as a foreground (camera|microphone) service for the
+     * duration of the recording — §4.6 screen-off survival. See RecordingService's doc
+     * for exactly what this does and does not cover (it does not own the pipeline).
+     */
+    private fun startRecordingService() {
+        val context = getApplication<Application>()
+        androidx.core.content.ContextCompat.startForegroundService(
+            context,
+            android.content.Intent(context, com.procamera.recorder.service.RecordingService::class.java),
+        )
+    }
+
+    private fun stopRecordingService() {
+        val context = getApplication<Application>()
+        context.stopService(android.content.Intent(context, com.procamera.recorder.service.RecordingService::class.java))
+    }
+
+    /**
      * Pulls peakDb/rmsDb at ~60fps. Pull (Choreographer-style polling) chosen over
      * JNI push per §4.2's "no JNI calls from audio callback thread" rule.
      */
@@ -434,6 +478,11 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         super.onCleared()
         stopRecordingJobs()
         pipeline.stopAll()
+        // Best-effort hygiene: if the ViewModel is torn down while the foreground service
+        // is up (this is itself the process-death/task-swipe scenario RecordingService's
+        // doc says is NOT covered — the pipeline is dying here too), at least don't leave
+        // a stuck notification/wake lock behind if the process happens to survive this.
+        stopRecordingService()
     }
 
     // ──────────────────────────────────────────────────────────────────────────

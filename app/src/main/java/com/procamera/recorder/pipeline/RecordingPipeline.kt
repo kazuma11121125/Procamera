@@ -27,6 +27,8 @@ import com.procamera.recorder.muxer.SegmentedMuxerController
 import com.procamera.recorder.ui.viewmodel.StorageLocation
 import java.io.File
 import java.nio.ByteBuffer
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * Unified camera/audio/encode/mux pipeline for Phase 4's full UI build.
@@ -96,6 +98,18 @@ class RecordingPipeline(private val context: Context) {
     private val sessionController = CameraSessionController(cameraManager)
 
     /**
+     * Guards every `sessionController.stop()` + `startRepeating()` pair (session
+     * open/close/reconfigure). Without this, e.g. rapid screen lock/unlock can fire
+     * overlapping [startPreview]/[detachPreviewSurface] calls whose suspend points
+     * (camera open, session configure) interleave — `CameraSessionController.stop()`
+     * nulls out `device`/`session` fields synchronously, so a second call's `stop()`
+     * landing between a first call's `openCamera()` and `createSession()` can corrupt
+     * that shared state. Not reentrant — callers must not call a `sessionMutex`-locked
+     * function from inside another one's locked block (see the `*Locked` helpers below).
+     */
+    private val sessionMutex = Mutex()
+
+    /**
      * Exposed so the ViewModel can poll [NativeEngineBridge.peakDb]/[NativeEngineBridge.rmsDb]
      * and update the audio meter StateFlow at ~60 fps. The engine is started in
      * [startRecording] and stopped in [stopRecordingInternal].
@@ -149,15 +163,22 @@ class RecordingPipeline(private val context: Context) {
     suspend fun startPreview(
         surface: Surface?,
         params: CameraParams = currentParams,
-    ): CameraCapabilities? {
+    ): CameraCapabilities? = sessionMutex.withLock {
         if (pipelineState == PipelineState.RECORDING) {
-            Log.w(TAG, "startPreview called during RECORDING — ignored")
-            return capabilities
+            // Preview surface (re)attach while a recording is already in progress — e.g.
+            // the app returned to the foreground after [detachPreviewSurface] dropped to
+            // an encoder-only session. Fold the surface back into the live session; the
+            // encoder-only session keeps recording running either way, so a failure here
+            // only means the viewfinder doesn't come back, not that recording stops (see
+            // reconfigureRecordingSurfacesLocked's doc).
+            previewSurface = surface
+            if (surface != null) reconfigureRecordingSurfacesLocked()
+            return@withLock capabilities
         }
         // Stop any existing preview session before re-opening (surface may have changed).
         if (pipelineState == PipelineState.PREVIEWING) stopPreviewSession()
 
-        return try {
+        try {
             val lens = capabilityInspector.findStandardRearLens()
                 ?: error("No standard rear lens found on this device")
 
@@ -358,14 +379,15 @@ class RecordingPipeline(private val context: Context) {
             // Camera2 requires closing the current session and opening a new one when the
             // output surface set changes — this causes a brief preview freeze (~100-200ms)
             // at recording-start time, which is an acceptable UX trade-off for v1.
-            sessionController.stop()
-            val surfaces = listOfNotNull(previewSurface, video.inputSurface)
-            sessionController.startRepeating(
-                cameraId = lens.cameraId,
-                outputSurfaces = surfaces,
-                requestFactory = factory,
-                params = currentParams,
-            )
+            sessionMutex.withLock {
+                sessionController.stop()
+                sessionController.startRepeating(
+                    cameraId = lens.cameraId,
+                    outputSurfaces = listOfNotNull(previewSurface, video.inputSurface),
+                    requestFactory = factory,
+                    params = currentParams,
+                )
+            }
 
             pipelineState = PipelineState.RECORDING
             Log.i(TAG, "Recording started → $outputDir")
@@ -389,6 +411,35 @@ class RecordingPipeline(private val context: Context) {
     suspend fun stopRecording() {
         if (pipelineState != PipelineState.RECORDING) return
         stopRecordingInternal(restartPreview = true)
+    }
+
+    /**
+     * Called when the Activity's preview Surface becomes unavailable (backgrounded /
+     * screen locked / `SurfaceView` destroyed).
+     *
+     * If a recording is in progress, reconfigures the live capture session to run on the
+     * encoder's InputSurface alone so recording keeps going without a preview consumer —
+     * this (together with the foreground service holding `FOREGROUND_SERVICE_CAMERA` so
+     * the OS still permits camera access while backgrounded) is what lets a recording
+     * survive screen-off per §4.6. If not recording, this just tears down the
+     * preview-only session as before.
+     *
+     * **実機未検証**: このAVDのカメラHALはこのアプリのVideoEncoder
+     * InputSurfaceへのストリーミングを(プレビューSurfaceの有無に関わらず)常に
+     * 拒否するため、`detachPreviewSurface()`が実際にセッションをエンコーダ単体へ
+     * 再構成できるかはエミュレータ上で検証できていない(§下記の実験記録参照)。
+     * ロジック自体は標準的なCamera2の単一Surfaceストリーミングであり実機では
+     * 動作するはずだが、実機での確認が必要。
+     */
+    @RequiresPermission(Manifest.permission.CAMERA)
+    suspend fun detachPreviewSurface() = sessionMutex.withLock {
+        val wasRecording = pipelineState == PipelineState.RECORDING
+        previewSurface = null
+        if (wasRecording) {
+            reconfigureRecordingSurfacesLocked()
+        } else {
+            stopPreviewSession()
+        }
     }
 
     /**
@@ -518,6 +569,45 @@ class RecordingPipeline(private val context: Context) {
         if (pipelineState == PipelineState.PREVIEWING) {
             sessionController.stop()
             pipelineState = PipelineState.IDLE
+        }
+    }
+
+    /**
+     * Rebuilds the live RECORDING-state capture session's surface set from the current
+     * [previewSurface] (may be null — encoder-only) plus the active [videoEncoder]'s
+     * InputSurface. Camera2 requires closing and reopening the session whenever the
+     * output surface set changes (see [startRecording]'s doc) — same mechanism, just
+     * triggered here by preview attach/detach instead of the initial preview→recording
+     * transition.
+     *
+     * Caller must already hold [sessionMutex] (not reentrant — do not call this from
+     * inside another `sessionMutex.withLock` block).
+     *
+     * Best-effort: recording is *not* aborted on failure here (e.g. a camera HAL
+     * rejecting the resulting surface combination). A failure means the viewfinder may
+     * not resume/detach cleanly, but the encoders keep running regardless — they don't
+     * know or care whether the session reconfiguration succeeded, only whether frames
+     * keep arriving at their InputSurface. If the HAL failure means frames *stop*
+     * arriving, that surfaces as a silent stall rather than a reported error — there is
+     * no `onEvent` channel threaded through preview attach/detach today. Full
+     * crash/stall recovery is out of scope here (§Phase4b, not yet built).
+     */
+    @RequiresPermission(Manifest.permission.CAMERA)
+    private suspend fun reconfigureRecordingSurfacesLocked() {
+        val video = videoEncoder ?: return
+        val lens = selectedLens ?: return
+        val factory = requestFactory ?: return
+        try {
+            sessionController.stop()
+            sessionController.startRepeating(
+                cameraId = lens.cameraId,
+                outputSurfaces = listOfNotNull(previewSurface, video.inputSurface),
+                requestFactory = factory,
+                params = currentParams,
+            )
+            Log.i(TAG, "Recording session reconfigured (preview=${previewSurface != null})")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to reconfigure recording session surfaces", e)
         }
     }
 

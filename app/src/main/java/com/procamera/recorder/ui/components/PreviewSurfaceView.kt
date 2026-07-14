@@ -60,6 +60,7 @@ fun PreviewSurfaceView(
                 // Camera2 handles resolution; we don't need to do anything here.
             }
 
+            @androidx.annotation.RequiresPermission(Manifest.permission.CAMERA)
             override fun surfaceDestroyed(holder: SurfaceHolder) {
                 viewModel.detachPreviewSurface()
             }

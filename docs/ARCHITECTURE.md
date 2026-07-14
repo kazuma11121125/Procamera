@@ -211,6 +211,23 @@ advisorから「`seedAudioAnchor()`が実際にフレーム相関に成功して
 
 **エミュレータで確認できなかったこと(録画の実データパス全体)**: REC ボタン押下→`startRecording()` の中で、プレビュー用 Surface とエンコーダの InputSurface を同時ストリームとしてセッション再構成する箇所で AVD のカメラHALが `Unsupported set of inputs/outputs provided` を返し失敗する。これはこのエミュレータのカメラHAL実装の制約と考えられる(該当コードパス自体が実機未検証である点は上記「実機確認待ち事項」に追記した)が、確定ではない。そのため **Video/Audioエンコード→Mux→ファイル生成のパイプライン全体、および今回追加した Movies フォルダへの MediaStore エクスポート機能は、実機または録画開始まで到達できる別のエミュレータ構成での再検証が必要**。
 
+**追加実験**: 上記の失敗が「プレビュー+エンコーダの2Surface同時構成」特有の問題(ストリーム数上限)なのか切り分けるため、一時的にエンコーダのInputSurfaceのみ(プレビュー無し、1Surfaceのみ)でセッション構成する実験を行った。**結果は同じ `Unsupported set of inputs/outputs provided` で失敗**——このAVDのカメラHALは、Surfaceの数に関わらずVideoEncoderのInputSurfaceへのストリーミング自体を受け付けない、より根本的な制約を持つと判断した(実験コードは元に戻し、本番コードには残していない)。したがって「2Surfaceが問題」という当初の仮説は誤りで、この環境ではエンコード経路そのものが検証不能というのが正確な理解。
+
+### フォアグラウンドサービスによる画面ロック時の録画継続(2026-07-14)
+
+`RecordingService`(旧: Phase1のビルド確認用スタブ、どこからも起動されていなかった)を実装し、録画中は実際に起動されるようにした。ユーザーから「実機は後ほど用意する、進めやすい順で進めてよい」との指示を受け、このセッションで見つけていた「録画が無人でライブセット全体を録り切れない可能性がある」というギャップ(§前回の指摘)に対応した。
+
+**スコープの明確化(過大申告しないこと)**: このServiceはパイプラインの所有権を持たない——`RecordingPipeline`は引き続き`CameraControlViewModel`が所有する。したがってこの実装がカバーするのは**「画面ロック/バックグラウンド化してもプロセス自体が生存し続ける」場合の録画継続**のみであり、**プロセスごとの破棄(タスクスワイプでの終了、メモリ不足によるプロセスkill)には対応していない**。後者にはパイプラインの所有権自体をServiceへ移す、より大きなリファクタリングが必要で、今回は着手していない(理由: 実機でのCamera2セッションのライフサイクル検証なしにこの規模の変更を行うのはリスクが高いとadvisorレビューで判断したため)。
+
+**実装した2つの要素(どちらか一方では画面ロック時の録画継続は成立しない)**:
+
+1. **`RecordingSession`のSurfaceライフサイクル対応**(`RecordingPipeline.detachPreviewSurface()` / `reconfigureRecordingSurfacesLocked()`): 従来、`CameraControlViewModel.detachPreviewSurface()`(`PreviewSurfaceView`の`surfaceDestroyed`から呼ばれる)は**ローカルのUI状態を`Idle`にリセットするだけで、`RecordingPipeline`側には一切通知していなかった**——つまり画面ロックでプレビューSurfaceが破棄されても、Camera2のセッションは死んだSurfaceを対象にしたまま何もせず放置される、という実質的なバグが存在した(録画中かどうかに関わらず)。修正後は、録画中にプレビューSurfaceが失われた場合はエンコーダのInputSurfaceのみのセッションに再構成して録画を継続し(`recordingState`は`Recording`のまま変更しない)、録画中でない場合はセッションを明示的に停止する。Activityがフォアグラウンドに戻った際は`attachPreviewSurface()`が同じ再構成ロジックでプレビューを復帰させる(録画中の場合はベストエフォート——失敗してもエンコード自体は継続)。
+2. **`sessionMutex`による排他制御**: advisorレビューで指摘された「画面の高速なロック/アンロックで`stop()`+`startRepeating()`のペアが複数同時に飛び、`CameraSessionController`の`session`/`device`フィールドが破損する」競合を防ぐため、`RecordingPipeline`に`Mutex`を追加し、セッションを触るすべての箇所(`startPreview`・`startRecording`のセッション再構成・`detachPreviewSurface`)を同じロックで直列化した。
+
+**`RecordingService`自体の実装内容**: `startForeground()`(API30+では`FOREGROUND_SERVICE_TYPE_CAMERA|MICROPHONE`を明示指定、API29ではマニフェスト宣言に委譲)、通知チャンネル作成、`PARTIAL_WAKE_LOCK`の取得/解放(安全弁として4時間で自動失効)。`CameraControlViewModel`が録画開始成功時(`Event.Started`)に`ContextCompat.startForegroundService()`で起動し、録画停止・失敗時に`stopService()`する。
+
+**実機未検証(重要)**: このAVDのカメラHALがVideoEncoder InputSurfaceへのストリーミング自体を(上記の追加実験の通り)受け付けないため、**録画そのものがエミュレータ上で開始できず、この一連の変更全体(Service起動タイミング・エンコーダ単体への再構成・Mutex排他制御)が実際の録画中に動作するかは未検証**。個別には標準的なAndroid API/Kotlin並行処理の用法であり、非録画時のプレビューのバックグラウンド/フォアグラウンド往復(`adb shell input keyevent KEYCODE_HOME`→再起動)はエミュレータで確認しクラッシュなし・正常復帰を確認したが、これは録画中の経路(§4.6の本題)の検証にはならない。**Phase5で実機による確認が必須**。
+
 ---
 
 ## 採用バージョン一覧(2026-07-13 時点で実在確認済み)

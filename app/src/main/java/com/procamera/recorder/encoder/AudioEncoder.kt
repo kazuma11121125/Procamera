@@ -65,6 +65,12 @@ class AudioEncoder(
     }
 
     private fun seedAudioAnchor() {
+        // Captured BEFORE the retry loop, not after: the ring buffer has been filling
+        // since nativeEngine.start() (called by our caller before this), so if correlation
+        // fails, "now" at the *start* of this method is a much closer approximation of
+        // sample 0's true capture time than "now" after burning the retry budget — see the
+        // real-device finding this fixes, in this method's class doc / ARCHITECTURE.md.
+        val fallbackAnchorNanos = System.nanoTime()
         repeat(ANCHOR_CORRELATION_MAX_ATTEMPTS) {
             val correlation = nativeEngine.getInputTimestamp()
             if (correlation != null) {
@@ -81,7 +87,7 @@ class AudioEncoder(
         Log.w(TAG, "getInputTimestamp() never returned a correlation after " +
             "$ANCHOR_CORRELATION_MAX_ATTEMPTS attempts; falling back to wall-clock audio anchor " +
             "(A/V sync may be off by the audio input pipeline's latency)")
-        ptsClockDomain.startAudioAnchor()
+        ptsClockDomain.startAudioAnchor(nowNanos = fallbackAnchorNanos)
     }
 
     /** Signals end-of-stream and waits for the drain thread to finish (§4.4's stop sequence). */

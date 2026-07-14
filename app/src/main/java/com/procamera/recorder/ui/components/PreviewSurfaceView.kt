@@ -35,6 +35,16 @@ import com.procamera.recorder.ui.viewmodel.CameraControlViewModel
  *   (e.g. 16/9 for 4K HEVC in landscape — but note the camera may be physically rotated
  *   90° relative to the sensor, so pass `9f/16f` for a portrait-mounted phone with a
  *   landscape sensor). Default `9f/16f` matches most portrait-orientation phone cameras.
+ *   Purely a Compose layout hint for sizing the container box — see [bufferWidth]/
+ *   [bufferHeight] for what actually controls the delivered pixel content.
+ * @param bufferWidth/[bufferHeight] The exact pixel size to pin this Surface's buffer
+ *   producer to via [SurfaceHolder.setFixedSize], matching [aspectRatio]. Without this,
+ *   Camera2 is free to configure the preview stream at whatever size the SurfaceHolder
+ *   defaults to — confirmed on real hardware (Sony SO-51C) to silently be a square
+ *   1080x1080 buffer regardless of the requested video config or device orientation, which
+ *   SurfaceFlinger's compositor then non-uniformly stretches to fill this composable's
+ *   (correctly-shaped) layout box. Must be set before [SurfaceHolder.Callback.surfaceCreated]
+ *   hands the surface to Camera2, so this take effect on the very first frame.
  * @param modifier Modifier for the outer layout.
  */
 @androidx.annotation.RequiresPermission(Manifest.permission.CAMERA)
@@ -43,6 +53,8 @@ fun PreviewSurfaceView(
     viewModel: CameraControlViewModel,
     modifier: Modifier = Modifier,
     aspectRatio: Float = 9f / 16f, // portrait phone with landscape-sensor camera (16:9 → 9:16)
+    bufferWidth: Int = 1080,
+    bufferHeight: Int = 1920,
 ) {
     val context = LocalContext.current
 
@@ -50,6 +62,7 @@ fun PreviewSurfaceView(
     val surfaceView = remember { SurfaceView(context) }
 
     DisposableEffect(surfaceView) {
+        surfaceView.holder.setFixedSize(bufferWidth, bufferHeight)
         val callback = object : SurfaceHolder.Callback {
             @androidx.annotation.RequiresPermission(Manifest.permission.CAMERA)
             override fun surfaceCreated(holder: SurfaceHolder) {
@@ -69,6 +82,14 @@ fun PreviewSurfaceView(
         onDispose {
             surfaceView.holder.removeCallback(callback)
         }
+    }
+
+    // Re-pin whenever the intended buffer size changes (resolution setting change, or
+    // orientation change while the surface is already alive) — surfaceCreated only fires
+    // once per Surface lifetime, but setFixedSize() can be called again on a live holder to
+    // reconfigure the producer for subsequent frames.
+    androidx.compose.runtime.LaunchedEffect(bufferWidth, bufferHeight) {
+        surfaceView.holder.setFixedSize(bufferWidth, bufferHeight)
     }
 
     val isLandscape = androidx.compose.ui.platform.LocalConfiguration.current.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE

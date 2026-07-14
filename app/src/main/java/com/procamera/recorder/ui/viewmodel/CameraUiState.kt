@@ -260,8 +260,18 @@ data class CameraUiState(
         else "%.1fm".format(distanceMeters)
     }
 
+    /** mm rather than a "×" multiplier, matching [CameraCapabilityInspector.AvailableLens.
+     * zoomLabel]'s doc — the ZOOM slider is continuous *within* the selected lens, so this
+     * is that lens's base 35mm-equivalent focal length scaled by the current digital
+     * [zoomRatio], not the ratio alone. Falls back to the old "×" form only if the current
+     * lens's focal length isn't known yet (e.g. before the first successful [availableLenses]
+     * population). */
     val zoomDisplayText: String get() {
-        return if (zoomRatio < 1.05f) "1x" else "%.1fx".format(zoomRatio)
+        val baseFocalLengthMm = availableLenses.firstOrNull { it.cameraId == selectedLensCameraId }
+            ?.equivalentFocalLengthMm
+        return if (baseFocalLengthMm != null) {
+            "%.0fmm".format(baseFocalLengthMm * zoomRatio)
+        } else if (zoomRatio < 1.05f) "1x" else "%.1fx".format(zoomRatio)
     }
 
     val videoConfigDisplayText: String get() {

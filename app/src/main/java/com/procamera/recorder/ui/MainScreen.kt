@@ -20,11 +20,13 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
@@ -54,6 +56,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.procamera.recorder.ui.components.FrameLineOverlay
+import com.procamera.recorder.ui.components.LevelGaugeOverlay
 import com.procamera.recorder.ui.components.StereoAudioMeter
 import com.procamera.recorder.ui.components.FocusSlider
 import com.procamera.recorder.ui.components.IsoSlider
@@ -124,21 +127,34 @@ fun MainScreen(
         ) {
             val configuration = androidx.compose.ui.platform.LocalConfiguration.current
             val isLandscape = configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
-            val config = state.selectedVideoConfig ?: state.capabilities?.videoConfig
-            val previewAspectRatio = if (config != null) {
-                if (isLandscape) {
-                    config.width.toFloat() / config.height.toFloat()
-                } else {
-                    config.height.toFloat() / config.width.toFloat()
-                }
-            } else {
-                if (isLandscape) 16f / 9f else 9f / 16f
-            }
+            // Fixed 16:9 preview buffer, deliberately NOT derived from
+            // state.selectedVideoConfig/capabilities.videoConfig: RecordingPipeline.
+            // startPreview()'s own doc already establishes that the preview session is
+            // independent of the eventual recording resolution (picking e.g. a 4:3 or 1:1
+            // recording config does not restart the preview session — see FrameLineOverlay
+            // for how non-16:9 targets are instead shown as a guide overlay on top of this
+            // same 16:9 preview). Deriving this from state.capabilities used to create a
+            // race: capabilities is only populated *after* the first attachPreviewSurface()
+            // call that this composable itself triggers, so the first composition pinned
+            // the SurfaceHolder (and thus the already-negotiated Camera2 stream size) to a
+            // fallback value, then a later recomposition changed the *Compose layout's*
+            // aspect ratio once capabilities arrived — but SurfaceHolder.setFixedSize() on a
+            // live holder cannot retroactively resize an already-configured capture session,
+            // so the box and the actual delivered buffer silently diverged again (confirmed
+            // via `dumpsys SurfaceFlinger --layers` on SO-51C: box settled at a stale
+            // 4:3-shaped size while activeBuffer stayed 1920x1080, non-uniform transform
+            // tr=[0.76,0][0,1.01]). A fixed, state-independent size removes the race
+            // entirely — see [PreviewSurfaceView]'s doc for the original 1080x1080-default
+            // finding this whole mechanism fixes.
+            val (previewWidth, previewHeight) = if (isLandscape) 1920 to 1080 else 1080 to 1920
+            val previewAspectRatio = previewWidth.toFloat() / previewHeight.toFloat()
 
             PreviewSurfaceView(
                 viewModel = viewModel,
                 modifier = Modifier.fillMaxSize(),
                 aspectRatio = previewAspectRatio,
+                bufferWidth = previewWidth,
+                bufferHeight = previewHeight,
             )
 
             // Composition guide (§FrameLineAspectRatio's doc) — preview-only, does not
@@ -155,14 +171,25 @@ fun MainScreen(
                 )
             }
 
-            // Audio meter — right side overlay on the preview. Two independent bars (L/R)
-            // since the mic input is stereo and one side can clip while the other doesn't
-            // (see CameraUiState's per-channel fields / dsp/PeakRmsMeter.h).
+            // Level gauge (水準器) — screen-centered like a traditional artificial horizon,
+            // always visible (not gated on state.showControls) for the same reason as the
+            // audio meter: framing/leveling should stay checkable while adjusting controls.
+            LevelGaugeOverlay(modifier = Modifier.align(Alignment.Center))
+
+            // Audio meter — top-LEFT overlay on the preview: the right side is now reserved
+            // for the docked control sidebar (see ControlPanel's doc for why it moved off a
+            // full-width bottom sheet), so the meter moved to the opposite corner to stay
+            // clear of it in both its shown and hidden states. Always visible (not gated on
+            // state.showControls) so levels stay readable while adjusting camera controls,
+            // matching a field production monitor's audio bridge. Two independent bars
+            // (L/R) since the mic input is stereo and one side can clip while the other
+            // doesn't (see CameraUiState's per-channel fields / dsp/PeakRmsMeter.h).
             Row(
                 modifier = Modifier
-                    .align(Alignment.CenterEnd)
-                    .padding(end = 8.dp)
-                    .height(200.dp),
+                    .align(Alignment.TopStart)
+                    .statusBarsPadding()
+                    .padding(start = 8.dp, top = 56.dp)
+                    .height(150.dp),
             ) {
                 StereoAudioMeter(
                     peakDbL = state.peakDbL,
@@ -188,35 +215,43 @@ fun MainScreen(
                     viewModel = viewModel,
                 )
             }
-            
-            // Bottom controls overlay
-            Column(
+
+            // Control sidebar — right-docked vertical strip (Sony Video Pro style: the
+            // preview stays visible across its left/majority instead of being covered by a
+            // full-width bottom sheet — see ControlPanel's doc). Slides in from the right
+            // edge rather than expanding vertically, matching the new dock direction.
+            androidx.compose.animation.AnimatedVisibility(
+                visible = state.showControls,
+                enter = androidx.compose.animation.slideInHorizontally(initialOffsetX = { it }) + androidx.compose.animation.fadeIn(),
+                exit = androidx.compose.animation.slideOutHorizontally(targetOffsetX = { it }) + androidx.compose.animation.fadeOut(),
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .fillMaxHeight(),
+            ) {
+                ControlPanel(
+                    state = state,
+                    viewModel = viewModel,
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .width(300.dp),
+                )
+            }
+
+            // REC status — small, always-visible (not gated on state.showControls, unlike
+            // the rest of StatusOverlay it used to live inside): recording is now started
+            // exclusively via the Xperia hardware camera key (CameraControlViewModel.
+            // toggleRecording(), wired in MainActivity.dispatchKeyEvent) rather than an
+            // on-screen button, per real-device feedback that the tappable REC circle was
+            // unwanted once the hardware key covered the same action. This indicator is
+            // the one thing that must never disappear, though — there is no other always-
+            // visible confirmation that a take is actually rolling.
+            Row(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .padding(bottom = 12.dp),
             ) {
-                androidx.compose.animation.AnimatedVisibility(
-                    visible = state.showControls,
-                    enter = androidx.compose.animation.expandVertically() + androidx.compose.animation.fadeIn(),
-                    exit = androidx.compose.animation.shrinkVertically() + androidx.compose.animation.fadeOut(),
-                ) {
-                    ControlPanel(
-                        state = state,
-                        viewModel = viewModel,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-                
-                RecordButtonBar(
-                    state = state,
-                    onRecordToggle = {
-                        if (state.isRecording) viewModel.stopRecording()
-                        else viewModel.startRecording()
-                    },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .navigationBarsPadding(),
-                )
+                RecIndicator(state = state)
             }
         }
 
@@ -302,8 +337,11 @@ private fun StatusOverlay(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        // ── Left: REC indicator + elapsed time ──────────────────────────────
-        RecIndicator(state = state)
+        // No left-side REC indicator here anymore — it moved to its own always-visible
+        // bottom-center overlay (MainScreen's Box) since this whole StatusOverlay hides
+        // with state.showControls, and REC status must never be hideable (see that call
+        // site's doc). Keeping this Row's remaining two groups at the edges rather than
+        // re-centering them; a config readout is best origin-anchored.
 
         // ── Center: video config ─────────────────────────────────────────────
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -312,7 +350,12 @@ private fun StatusOverlay(
                 val h = state.selectedVideoConfig?.height ?: it.videoConfig.height
                 val fps = state.selectedVideoConfig?.frameRate ?: it.videoConfig.frameRate
                 val mbps = (state.selectedVideoConfig?.bitrate ?: it.videoConfig.bitrate) / 1_000_000
-                "${w}×${h} ${fps}fps ${mbps}Mbps"
+                // Display-only aperture readout (phone lenses are fixed-aperture — see
+                // CameraCapabilities.apertureFNumber's doc) appended alongside the other
+                // fixed specs of the current lens/format, not the adjustable ones (those —
+                // ISO/shutter — live in the sidebar sliders, not this summary line).
+                val fStop = it.apertureFNumber?.let { f -> " F%.1f".format(f) } ?: ""
+                "${w}×${h} ${fps}fps ${mbps}Mbps$fStop"
             } ?: "—"
             Text(
                 text = configText,
@@ -391,6 +434,17 @@ private fun RecIndicator(state: CameraUiState) {
 // Control panel
 // ──────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Right-docked vertical control strip (CAMERA/AUDIO tabs + sliders), styled after Sony's
+ * Video Pro/Photo Pro control layout (Sony__________.pdf: 露出コントロール・ホワイトバランス
+ * ・UIアシスト機能が撮影画面の脇に常設される設計). Previously this was a full-width bottom
+ * sheet that, once expanded, covered most of the frame below the top status readout —
+ * real-device feedback flagged this as actively hard to use (you can't judge framing/focus
+ * while adjusting a slider). Docking it to a fixed-width strip on one edge instead leaves
+ * the rest of the preview visible throughout. The tab row stays pinned at the top; the
+ * slider content below scrolls, since the full CAMERA/AUDIO control set is taller than the
+ * strip at any reasonable width.
+ */
 @Composable
 private fun ControlPanel(
     state: CameraUiState,
@@ -399,10 +453,12 @@ private fun ControlPanel(
 ) {
     Column(
         modifier = modifier
-            .background(SurfaceDark.copy(alpha = 0.85f))
-            .clip(RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp)),
+            .background(SurfaceDark.copy(alpha = 0.90f))
+            .clip(RoundedCornerShape(topStart = 16.dp, bottomStart = 16.dp))
+            .statusBarsPadding()
+            .navigationBarsPadding(),
     ) {
-        // Tab row
+        // Tab row (pinned — does not scroll with the content below)
         val tabs = listOf("CAMERA", "AUDIO")
         val selectedIndex = if (state.activePanel == ControlPanel.Camera) 0 else 1
 
@@ -432,20 +488,24 @@ private fun ControlPanel(
 
         HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
 
-        when (state.activePanel) {
-            ControlPanel.Camera -> CameraControlsPanel(
-                state = state,
-                viewModel = viewModel,
-            )
+        Column(
+            modifier = Modifier.verticalScroll(androidx.compose.foundation.rememberScrollState()),
+        ) {
+            when (state.activePanel) {
+                ControlPanel.Camera -> CameraControlsPanel(
+                    state = state,
+                    viewModel = viewModel,
+                )
 
-            ControlPanel.Audio -> AudioControlsPanel(
-                state = state,
-                onInputGainChange = viewModel::setInputGainDb,
-                onEqGainChange = viewModel::setEqBandGain,
-                onEqFreqChange = viewModel::setEqBandFreq,
-                onEqQChange = viewModel::setEqBandQ,
-                onMonitorToggle = viewModel::setMonitoringEnabled,
-            )
+                ControlPanel.Audio -> AudioControlsPanel(
+                    state = state,
+                    onInputGainChange = viewModel::setInputGainDb,
+                    onEqGainChange = viewModel::setEqBandGain,
+                    onEqFreqChange = viewModel::setEqBandFreq,
+                    onEqQChange = viewModel::setEqBandQ,
+                    onMonitorToggle = viewModel::setMonitoringEnabled,
+                )
+            }
         }
     }
 }
@@ -490,10 +550,21 @@ private fun CameraControlsPanel(
                             .background(bg)
                             .border(1.dp, if (isSelected) Amber else MaterialTheme.colorScheme.outline, RoundedCornerShape(16.dp))
                             .clickable { onLensSelected(lens) }
-                            .padding(horizontal = 12.dp, vertical = 4.dp),
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
                         contentAlignment = Alignment.Center
                     ) {
-                        Text(text = lens.zoomLabel, color = tc, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        // maxLines/softWrap=false: mm labels ("135mm") run wider than the old
+                        // "×" ratio labels ("3x") did, and this Box has no fixed width — a
+                        // real-device check showed the longest label wrapping to two lines
+                        // ("88m"/"m") inside its pill instead of just fitting on one.
+                        Text(
+                            text = lens.zoomLabel,
+                            color = tc,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            softWrap = false,
+                        )
                     }
                 }
             }
@@ -883,68 +954,3 @@ private fun EqBandRow(
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Record button bar
-// ──────────────────────────────────────────────────────────────────────────────
-
-@Composable
-private fun RecordButtonBar(
-    state: CameraUiState,
-    onRecordToggle: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val buttonColor by animateColorAsState(
-        targetValue = when {
-            state.isRecording -> RecRed
-            state.canStartRecording -> RecRed.copy(alpha = 0.85f)
-            else -> OnSurfaceSecondary.copy(alpha = 0.3f)
-        },
-        animationSpec = tween(200),
-        label = "rec_button_color",
-    )
-
-    Box(
-        modifier = modifier
-            .padding(vertical = 12.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            // Big record button
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .size(72.dp)
-                    .clip(CircleShape)
-                    .background(
-                        if (state.recButtonEnabled) RecRed.copy(alpha = 0.15f) else Color.Transparent,
-                    )
-                    .border(2.dp, if (state.recButtonEnabled) RecRed else OnSurfaceSecondary.copy(alpha = 0.3f), CircleShape)
-                    .clickable(enabled = state.recButtonEnabled, onClick = onRecordToggle),
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(if (state.isRecording) 28.dp else 48.dp)
-                        .clip(if (state.isRecording) RoundedCornerShape(6.dp) else CircleShape)
-                        .background(buttonColor),
-                )
-            }
-
-            Spacer(Modifier.height(6.dp))
-
-            Text(
-                text = when (state.recordingState) {
-                    RecordingUiState.Idle -> "準備中"
-                    RecordingUiState.StartingPreview -> "カメラ起動中…"
-                    RecordingUiState.Previewing -> "● REC"
-                    RecordingUiState.StartingRecording -> "録画開始中…"
-                    RecordingUiState.Recording -> "■ STOP"
-                    RecordingUiState.Stopping -> "停止中…"
-                },
-                color = if (state.recButtonEnabled) OnSurfacePrimary else OnSurfaceSecondary,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.SemiBold,
-                textAlign = TextAlign.Center,
-            )
-        }
-    }
-}

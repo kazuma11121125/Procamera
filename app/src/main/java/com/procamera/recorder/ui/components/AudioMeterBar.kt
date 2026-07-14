@@ -1,52 +1,62 @@
 package com.procamera.recorder.ui.components
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.material3.MaterialTheme
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.procamera.recorder.ui.theme.MeterGreen
 import com.procamera.recorder.ui.theme.MeterOrange
 import com.procamera.recorder.ui.theme.MeterRed
 import com.procamera.recorder.ui.theme.MeterYellow
+import com.procamera.recorder.ui.theme.OnSurfacePrimary
 import com.procamera.recorder.ui.theme.OnSurfaceSecondary
-import com.procamera.recorder.ui.theme.RecRed
+import com.procamera.recorder.ui.theme.SurfaceBlack
 import com.procamera.recorder.ui.theme.SurfaceVariant
 
 /**
- * Vertical audio level meter (§4.5) drawn entirely with Canvas for minimal overhead
- * at the ~60fps update rate driven by [CameraControlViewModel]'s meter polling coroutine.
+ * Segmented (LED-bridge style) vertical audio level meter (§4.5), styled after a field
+ * production audio bridge rather than a single smooth bar: discrete lit/unlit blocks
+ * (broadcast dBFS colour zones: green ≤−12, yellow ≤−6, orange/red above), a numeric peak
+ * dBFS readout above the bar, and a peak-hold highlighted segment. Drawn entirely with
+ * Canvas for minimal overhead at the ~60fps update rate driven by
+ * [CameraControlViewModel]'s meter polling.
  *
- * dBFS colour zones (matching broadcast convention):
- * ```
- *   > −6 dBFS   Orange
- *   > −12 dBFS  Yellow
- *   ≤ −12 dBFS  Green
- *   Peak hold line at the highest recent level
- * ```
- *
- * The CLIPPING badge (−0.1 dBFS trigger, 3s hold) is overlaid as a Text composable above
- * the meter bar rather than drawn in Canvas to use Material3 typography.
+ * Sizing is entirely caller-driven via [modifier] (this composable is only ever used
+ * inside [StereoAudioMeter], which supplies a weighted width + fillMaxHeight) — there is
+ * deliberately no internal default width/height here, to avoid two competing size
+ * constraints.
  *
  * @param peakDb   Instantaneous peak in dBFS (−120 = silence sentinel).
- * @param rmsDb    Short-term RMS in dBFS.
+ * @param rmsDb    Short-term RMS in dBFS — drives the lit segment count.
  * @param isClippingHeld  True when within the 3s clipping hold window (§4.5).
- * @param width    Width of the single-bar meter column.
  */
 @Composable
 fun AudioMeterBar(
@@ -54,33 +64,51 @@ fun AudioMeterBar(
     rmsDb: Float,
     isClippingHeld: Boolean,
     modifier: Modifier = Modifier,
-    width: Dp = 14.dp,
 ) {
-    Box(
-        modifier = modifier
-            .width(width)
-            .fillMaxHeight(),
-        contentAlignment = Alignment.TopCenter,
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            drawMeterBar(peakDb, rmsDb)
-        }
-
-        if (isClippingHeld) {
-            Text(
-                text = "CLIP",
-                color = RecRed,
-                fontSize = 7.sp,
-                fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.align(Alignment.TopCenter),
-            )
+        Text(
+            text = if (peakDb <= DB_FLOOR) "···" else "%.1f".format(peakDb),
+            color = if (isClippingHeld) MeterRed else OnSurfacePrimary,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 9.sp,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+        )
+        Spacer(modifier = Modifier.height(2.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f, fill = true)
+                .clip(RoundedCornerShape(2.dp))
+                .background(SurfaceBlack)
+                .border(1.dp, SurfaceVariant, RoundedCornerShape(2.dp)),
+            contentAlignment = Alignment.TopCenter,
+        ) {
+            Canvas(modifier = Modifier.fillMaxSize().padding(2.dp)) {
+                drawSegmentedMeter(peakDb, rmsDb)
+            }
+            if (isClippingHeld) {
+                Text(
+                    text = "CLIP",
+                    color = Color.White,
+                    fontSize = 7.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .background(MeterRed)
+                        .padding(horizontal = 2.dp),
+                )
+            }
         }
     }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Two-channel (stereo) meter side-by-side
+// Two-channel (stereo) field-style meter bridge, with a shared dB scale between the bars.
 // ──────────────────────────────────────────────────────────────────────────────
 
 @Composable
@@ -93,20 +121,68 @@ fun StereoAudioMeter(
     isClippingHeldR: Boolean,
     modifier: Modifier = Modifier,
 ) {
-    androidx.compose.foundation.layout.Row(
-        modifier = modifier,
-        horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(4.dp),
+    Column(
+        // Fixed (not min-only) width: the inner Row below uses weight() to split the two
+        // bars evenly, which needs a bounded width from its parent chain. This composable's
+        // own caller (MainScreen) wraps it in a Row with no explicit width of its own (just
+        // wrap-content) — leaving this at widthIn(min=...) let that ambiguity propagate
+        // down to the weight()s and the whole meter silently collapsed to zero size
+        // (observed on-device: no crash, just nothing drawn). A fixed width here breaks
+        // that ambiguity regardless of how the caller sizes its wrapper.
+        modifier = modifier
+            .fillMaxHeight()
+            .width(84.dp)
+            .clip(RoundedCornerShape(6.dp))
+            .background(SurfaceVariant.copy(alpha = 0.55f))
+            .border(1.dp, OnSurfaceSecondary.copy(alpha = 0.3f), RoundedCornerShape(6.dp))
+            .padding(6.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        AudioMeterBar(
-            peakDb = peakDbL,
-            rmsDb = rmsDbL,
-            isClippingHeld = isClippingHeldL,
-        )
-        AudioMeterBar(
-            peakDb = peakDbR,
-            rmsDb = rmsDbR,
-            isClippingHeld = isClippingHeldR,
-        )
+        Row(
+            modifier = Modifier.weight(1f, fill = true).fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            AudioMeterBar(
+                peakDb = peakDbL, rmsDb = rmsDbL, isClippingHeld = isClippingHeldL,
+                modifier = Modifier.weight(1f).fillMaxHeight(),
+            )
+            DbScale(modifier = Modifier.fillMaxHeight().width(18.dp).padding(top = 15.dp))
+            AudioMeterBar(
+                peakDb = peakDbR, rmsDb = rmsDbR, isClippingHeld = isClippingHeldR,
+                modifier = Modifier.weight(1f).fillMaxHeight(),
+            )
+        }
+        Spacer(modifier = Modifier.height(3.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text("L", color = OnSurfaceSecondary, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+            Text("R", color = OnSurfaceSecondary, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+/** Numeric dB scale shared between the L/R bars, mirroring a hardware meter bridge's centre scale. */
+@Composable
+private fun DbScale(modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier) {
+        val tickDbs = listOf(0f, -6f, -12f, -24f, -48f)
+        val paint = android.graphics.Paint().apply {
+            color = OnSurfaceSecondary.toArgb()
+            textSize = 8.sp.toPx()
+            textAlign = android.graphics.Paint.Align.CENTER
+            isAntiAlias = true
+        }
+        for (tickDb in tickDbs) {
+            val y = size.height * (1f - dbToFraction(tickDb))
+            drawContext.canvas.nativeCanvas.drawText(
+                if (tickDb == 0f) "0" else tickDb.toInt().toString(),
+                size.width / 2f,
+                y + 3.dp.toPx(),
+                paint,
+            )
+        }
     }
 }
 
@@ -116,6 +192,8 @@ fun StereoAudioMeter(
 
 private const val DB_FLOOR = -60f      // lowest dBFS displayed
 private const val DB_CEIL = 0f         // top of meter (0 dBFS)
+private const val SEGMENT_COUNT = 24   // discrete LED-style blocks, ~2.5dB each
+private const val SEGMENT_GAP_FRACTION = 0.18f // fraction of each segment's height left as a gap
 
 /** Maps a dBFS value to a fraction [0, 1] where 0 = silence and 1 = full scale. */
 private fun dbToFraction(db: Float): Float {
@@ -131,80 +209,28 @@ private fun meterColor(db: Float): Color = when {
     else -> MeterGreen
 }
 
-private fun DrawScope.drawMeterBar(peakDb: Float, rmsDb: Float) {
+/** Unlit segment colour — a faint tint of the zone's own colour, not a flat grey, so the
+ * scale's colour structure is legible even at rest (matching a hardware LED bridge). */
+private fun unlitSegmentColor(db: Float): Color = meterColor(db).copy(alpha = 0.12f)
+
+private fun DrawScope.drawSegmentedMeter(peakDb: Float, rmsDb: Float) {
     val w = size.width
     val h = size.height
-    val cornerRadius = CornerRadius(2.dp.toPx())
+    val segmentH = h / SEGMENT_COUNT
+    val gap = segmentH * SEGMENT_GAP_FRACTION
+    val litFraction = dbToFraction(rmsDb)
+    val litSegments = (litFraction * SEGMENT_COUNT).toInt()
+    val peakSegment = if (peakDb > DB_FLOOR) (dbToFraction(peakDb) * SEGMENT_COUNT).toInt().coerceIn(0, SEGMENT_COUNT - 1) else -1
 
-    // Background track
-    drawRoundRect(
-        color = SurfaceVariant,
-        topLeft = Offset.Zero,
-        size = Size(w, h),
-        cornerRadius = cornerRadius,
-    )
-
-    // RMS fill (bottom-anchored, segmented by dB zone)
-    val rmsTop = h * (1f - dbToFraction(rmsDb))
-    if (rmsDb > DB_FLOOR) {
-        // Draw three colour segments: green up to -12, yellow -12 to -6, orange -6 to 0.
-        // We clip each segment to the actual rms level so the bar is segmented by colour.
-        drawSegment(rmsTop, h, w, -60f, -12f, MeterGreen, cornerRadius)
-        drawSegment(rmsTop, h, w, -12f, -6f, MeterYellow, cornerRadius)
-        drawSegment(rmsTop, h, w, -6f, 0f, MeterOrange, cornerRadius)
-    }
-
-    // Peak hold tick mark (1px line in red when near clip, else white)
-    if (peakDb > DB_FLOOR) {
-        val peakY = h * (1f - dbToFraction(peakDb))
-        val tickColor = if (peakDb > -6f) MeterRed else Color.White.copy(alpha = 0.7f)
-        drawLine(
-            color = tickColor,
-            start = Offset(0f, peakY),
-            end = Offset(w, peakY),
-            strokeWidth = 2.dp.toPx(),
+    for (i in 0 until SEGMENT_COUNT) {
+        val segMinDb = DB_FLOOR + (DB_CEIL - DB_FLOOR) * i / SEGMENT_COUNT
+        val segTop = h - (i + 1) * segmentH
+        val color = if (i < litSegments || i == peakSegment) meterColor(segMinDb) else unlitSegmentColor(segMinDb)
+        drawRoundRect(
+            color = color,
+            topLeft = Offset(0f, segTop + gap / 2f),
+            size = Size(w, segmentH - gap),
+            cornerRadius = CornerRadius(1.dp.toPx()),
         )
     }
-
-    // dB scale ticks (−48, −36, −24, −12, −6)
-    val tickDbs = listOf(-48f, -36f, -24f, -12f, -6f)
-    for (tickDb in tickDbs) {
-        val tickY = h * (1f - dbToFraction(tickDb))
-        drawLine(
-            color = OnSurfaceSecondary.copy(alpha = 0.35f),
-            start = Offset(w * 0.6f, tickY),
-            end = Offset(w, tickY),
-            strokeWidth = 0.5.dp.toPx(),
-        )
-    }
-}
-
-/**
- * Draws the portion of a colour zone that is below the [rmsTop] cutoff.
- *
- * @param rmsTop    Y-coordinate (from top) of the actual RMS level.
- * @param totalH    Total height of the meter.
- * @param zoneMinDb Lower dBFS bound of this zone.
- * @param zoneMaxDb Upper dBFS bound of this zone.
- */
-private fun DrawScope.drawSegment(
-    rmsTop: Float,
-    totalH: Float,
-    totalW: Float,
-    zoneMinDb: Float,
-    zoneMaxDb: Float,
-    color: Color,
-    cornerRadius: CornerRadius,
-) {
-    val zoneTop = totalH * (1f - dbToFraction(zoneMaxDb))
-    val zoneBottom = totalH * (1f - dbToFraction(zoneMinDb))
-    val segTop = maxOf(rmsTop, zoneTop)
-    val segBottom = minOf(totalH, zoneBottom)
-    if (segTop >= segBottom) return
-    drawRoundRect(
-        color = color,
-        topLeft = Offset(0f, segTop),
-        size = Size(totalW, segBottom - segTop),
-        cornerRadius = cornerRadius,
-    )
 }

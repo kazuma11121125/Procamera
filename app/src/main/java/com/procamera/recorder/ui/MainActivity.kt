@@ -9,6 +9,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -34,6 +35,7 @@ import com.procamera.recorder.ui.theme.Amber
 import com.procamera.recorder.ui.theme.OnSurfaceSecondary
 import com.procamera.recorder.ui.theme.ProCameraTheme
 import com.procamera.recorder.ui.theme.SurfaceBlack
+import com.procamera.recorder.ui.viewmodel.CameraControlViewModel
 
 /**
  * Host Activity for ProCamera.
@@ -48,6 +50,11 @@ import com.procamera.recorder.ui.theme.SurfaceBlack
  * [CameraControlViewModel] and [MainScreen] — the Activity is intentionally thin.
  */
 class MainActivity : ComponentActivity() {
+
+    // Same instance MainScreen's `viewModel()` call resolves later (both go through this
+    // Activity's ViewModelStore) — obtained here too so the hardware key handler below has
+    // somewhere to dispatch to without threading a reference through the Compose tree.
+    private val viewModel: CameraControlViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -66,6 +73,26 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * Xperia's dedicated hardware camera/shutter key (Sony__________.pdf: "カメラキー(シャッ
+     * ターボタン)の割り当てAssign shutter button") toggles REC, mirroring the on-screen
+     * button (§[CameraControlViewModel.toggleRecording]). Handled at `dispatchKeyEvent`
+     * rather than `onKeyDown` so it's intercepted ahead of Compose's own focus-based key
+     * handling — none of the current UI needs `KEYCODE_CAMERA` for anything else, so there
+     * is nothing to conflict with. `repeatCount == 0` guards against a held key re-firing
+     * on every auto-repeat tick.
+     */
+    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
+        if (event.keyCode == android.view.KeyEvent.KEYCODE_CAMERA &&
+            event.action == android.view.KeyEvent.ACTION_DOWN &&
+            event.repeatCount == 0
+        ) {
+            viewModel.toggleRecording()
+            return true
+        }
+        return super.dispatchKeyEvent(event)
     }
 }
 

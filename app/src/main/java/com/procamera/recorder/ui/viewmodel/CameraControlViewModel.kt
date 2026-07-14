@@ -15,11 +15,16 @@ import com.procamera.recorder.camera.CameraParams
 import com.procamera.recorder.camera.CaptureRangeClamper
 import com.procamera.recorder.pipeline.RecordingPipeline
 import com.procamera.recorder.utils.ThermalMonitor
+import com.procamera.recorder.utils.UserPreferencesStore
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -42,15 +47,46 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
     private val capabilityInspector =
         CameraCapabilityInspector(app.getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager)
     private val thermalMonitor = ThermalMonitor(app)
+    private val userPrefs = UserPreferencesStore(app)
 
     private val _uiState = MutableStateFlow(CameraUiState())
     val uiState: StateFlow<CameraUiState> = _uiState.asStateFlow()
-    
+
     private var lastAutoKelvin: Double? = null
     private var lastAutoGains: android.hardware.camera2.params.RggbChannelVector? = null
     private var lastAutoFocus: Float? = null
 
+    /** Guards [restorePersistedSettings] to run only once per process — attachPreviewSurface
+     * re-enters on every screen-lock/unlock cycle (§4.6), which must NOT re-apply the saved
+     * settings over whatever the user has since changed live. */
+    private var hasRestoredPersistedSettings = false
+
     init {
+        // Debounced auto-save: writes settle ~800ms after the last *persistence-relevant*
+        // change, not on every intermediate value during a slider drag
+        // (UserPreferencesStore.save's doc). Critically, this maps down to a small
+        // equality-comparable snapshot BEFORE debounce()/distinctUntilChanged() — mapping
+        // straight off the raw `uiState` flow doesn't work, because that flow also carries
+        // the audio meter's peakDb/rmsDb fields, which startMeterPolling() updates every
+        // ~33ms for as long as preview is up (i.e. almost always). debounce() only fires
+        // after a quiet gap with no new emissions; against the raw flow, the meter's
+        // constant churn means that gap never happens, so the collector never fires at all
+        // past its first tick (confirmed on real hardware: the saved prefs file only ever
+        // contained CameraUiState()'s plain defaults, frozen from the single emission before
+        // the meter starts). Filtering to only the fields this store actually persists
+        // means the meter's own updates no longer count as "activity" for debounce purposes.
+        // drop(1): skip the initial CameraUiState() default snapshot — nothing to persist
+        // yet, and it would otherwise briefly overwrite a real saved value with the default
+        // if this collector's first tick raced restorePersistedSettings's own writes.
+        viewModelScope.launch {
+            uiState
+                .map { PersistSnapshot(it) }
+                .distinctUntilChanged()
+                .drop(1)
+                .debounce(800L)
+                .collect { userPrefs.save(_uiState.value) }
+        }
+
         // Registers this ViewModel's single RecordingPipeline instance with the
         // Application-level crash handler so an uncaught exception can attempt a
         // best-effort finalize of whatever segment is currently open (§4.6) — see
@@ -113,11 +149,15 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
                 // after [detachPreviewSurface] dropped to an encoder-only session (§4.6
                 // screen-off survival). pipeline.startPreview() already folded the surface
                 // back into the live session (or logged a failure); recordingState stays
-                // Recording either way — only refresh capabilities if they came back.
+                // Recording either way — only refresh capabilities if they came back. Meter
+                // polling is already running (started when this recording began, or earlier
+                // still at the original preview) — startMeterPolling() is a no-op here.
                 if (caps != null) _uiState.update { it.copy(capabilities = caps, errorMessage = null) }
                 return@launch
             }
             if (caps != null) {
+                // Meter usable for a sound check before REC — see startMeterPolling's doc.
+                startMeterPolling()
                 // Enumerate lenses for the lens selector.
                 val allLenses = try { capabilityInspector.allRearLenses() } catch (e: Exception) { emptyList() }
                 val supportedConfigs = try {
@@ -141,6 +181,10 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
                         errorMessage = null,
                     )
                 }
+                if (!hasRestoredPersistedSettings) {
+                    hasRestoredPersistedSettings = true
+                    restorePersistedSettings(caps, allLenses, supportedConfigs)
+                }
             } else {
                 _uiState.update {
                     it.copy(
@@ -163,8 +207,62 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
             // only the viewfinder is gone until attachPreviewSurface() reattaches it.
             pipeline.detachPreviewSurface()
             if (!wasRecording) {
+                stopMeterPolling()
                 _uiState.update { it.copy(recordingState = RecordingUiState.Idle) }
             }
+        }
+    }
+
+    /**
+     * Applies [UserPreferencesStore]'s last-saved values on top of the fresh
+     * [attachPreviewSurface] state — called exactly once per process (see
+     * [hasRestoredPersistedSettings]), right after the first successful preview start.
+     * Real-device feedback: re-dialing in lens/zoom/ISO/shutter/WB/EQ on every single
+     * launch was the actual friction point.
+     *
+     * Goes through the existing public setters wherever one exists (reuses their
+     * clamping/native-application logic) rather than folding values into a raw
+     * `_uiState.update`. The one exception is zoom when the saved lens also needs
+     * restoring: [switchLens] resets zoom to 1.0 as part of its own async state update, so
+     * a saved zoom must be threaded through its `initialZoomRatio` parameter instead of
+     * applied via a separate later [setZoom] call, which would otherwise race it.
+     */
+    private fun restorePersistedSettings(
+        caps: RecordingPipeline.CameraCapabilities,
+        allLenses: List<CameraCapabilityInspector.AvailableLens>,
+        supportedConfigs: List<CameraCapabilityInspector.VideoConfigCandidate>,
+    ) {
+        val saved = userPrefs.load()
+
+        saved.iso?.let { setIso(it.coerceIn(caps.isoRange)) }
+        saved.exposureTimeNanos?.let {
+            setExposureTime(it.coerceIn(caps.exposureTimeRangeNanos.first, caps.exposureTimeRangeNanos.last))
+        }
+        setWbAuto(saved.wbAuto)
+        if (!saved.wbAuto) saved.kelvin?.let(::setKelvin)
+        setAfAuto(saved.afAuto)
+        setFrameLineAspectRatio(saved.frameLineAspectRatio)
+        setInputGainDb(saved.inputGainDb)
+        setMonitoringEnabled(saved.monitoringEnabled)
+        setStorageLocation(saved.storageLocation)
+        saved.segmentDurationMinutes?.let(::setSegmentDuration)
+        saved.eqBands.forEachIndexed { i, band ->
+            if (band.freqHz != null && band.q != null && band.gainDb != null) {
+                setEqBand(i, band.freqHz, band.q, band.gainDb)
+            }
+        }
+
+        val savedConfig = supportedConfigs.firstOrNull {
+            it.width == saved.videoConfigWidth && it.height == saved.videoConfigHeight &&
+                it.frameRate == saved.videoConfigFps
+        }
+        if (savedConfig != null) selectVideoConfig(savedConfig)
+
+        val savedLens = allLenses.firstOrNull { it.cameraId == saved.lensCameraId }
+        if (savedLens != null && savedLens.cameraId != caps.cameraId) {
+            switchLens(savedLens, initialZoomRatio = saved.zoomRatio ?: 1.0f)
+        } else {
+            saved.zoomRatio?.let(::setZoom)
         }
     }
 
@@ -173,14 +271,22 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
     // ──────────────────────────────────────────────────────────────────────────
 
     @androidx.annotation.RequiresPermission(Manifest.permission.CAMERA)
-    fun switchLens(lens: CameraCapabilityInspector.AvailableLens) {
+    /**
+     * @param initialZoomRatio Zoom to apply once the switch completes — defaults to 1.0
+     * (reset zoom on lens switch, the normal user-initiated case). [restorePersistedSettings]
+     * passes the last-used zoom instead, threaded through here rather than applied via a
+     * separate post-hoc [setZoom] call, since that would race this method's own async
+     * `_uiState.update` (which otherwise unconditionally resets zoomRatio to 1.0).
+     */
+    fun switchLens(lens: CameraCapabilityInspector.AvailableLens, initialZoomRatio: Float = 1.0f) {
         if (_uiState.value.isRecording) return
         val surface = previewSurface ?: return
+        val clampedZoom = initialZoomRatio.coerceIn(1.0f, lens.maxDigitalZoom)
 
         _uiState.update { it.copy(recordingState = RecordingUiState.StartingPreview) }
         viewModelScope.launch {
-            val params = _uiState.value.toCameraParams().copy(zoomRatio = 1.0f) // reset zoom on lens switch
-            val caps = pipeline.startPreview(surface, params)
+            val params = _uiState.value.toCameraParams().copy(zoomRatio = clampedZoom)
+            val caps = pipeline.startPreview(surface, params, targetCameraId = lens.cameraId)
             if (caps != null) {
                 val supportedConfigs = try {
                     capabilityInspector.supportedVideoConfigs(caps.cameraId)
@@ -195,7 +301,7 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
                         availableVideoConfigs = supportedConfigs,
                         selectedVideoConfig = selectedConfig,
                         maxZoomRatio = lens.maxDigitalZoom,
-                        zoomRatio = 1.0f,
+                        zoomRatio = clampedZoom,
                         fps = selectedConfig.frameRate,
                         errorMessage = null,
                     )
@@ -293,6 +399,20 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
                 _uiState.update { it.copy(recordingState = RecordingUiState.Idle) }
             }
         }
+    }
+
+    /**
+     * Same start/stop branch as the on-screen REC button's onClick (MainScreen's
+     * RecordButtonBar), factored out so a hardware trigger — MainActivity's
+     * `dispatchKeyEvent` override for `KEYCODE_CAMERA` (Xperia's dedicated shutter key,
+     * per Sony__________.pdf's "カメラキー(シャッターボタン)の割り当て") — doesn't have to
+     * duplicate it. Safe to call regardless of current state: [startRecording]/
+     * [stopRecording] each no-op unless the recording state actually permits them.
+     */
+    @Suppress("MissingPermission") // see startRecording()/stopRecording()'s own annotations;
+    // this is only reachable once MainScreen (and therefore PermissionGate) is composed.
+    fun toggleRecording() {
+        if (_uiState.value.isRecording) stopRecording() else startRecording()
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -436,14 +556,13 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
     // ──────────────────────────────────────────────────────────────────────────
 
     private fun startRecordingJobs() {
-        startMeterPolling()
         startElapsedTimer()
         startStorageMonitor()
     }
 
     private fun stopRecordingJobs() {
-        meterJob?.cancel(); timerJob?.cancel(); storageJob?.cancel()
-        meterJob = null; timerJob = null; storageJob = null
+        timerJob?.cancel(); storageJob?.cancel()
+        timerJob = null; storageJob = null
     }
 
     /**
@@ -465,13 +584,28 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Pulls per-channel peakDb/rmsDb at ~60fps. Pull (Choreographer-style polling) chosen
-     * over JNI push per §4.2's "no JNI calls from audio callback thread" rule.
+     * Pulls per-channel peakDb/rmsDb at ~30fps. Pull (Choreographer-style polling) chosen
+     * over JNI push per §4.2's "no JNI calls from audio callback thread" rule. 30fps rather
+     * than a tighter 60fps: this loop now runs continuously for as long as preview is up
+     * (see the lifecycle note below), not just while recording, so real-device thermal
+     * testing showed it's a meaningful *sustained* background contributor to heat/battery
+     * (4x JNI calls + a StateFlow update + a Canvas recomposition, every tick, indefinitely)
+     * — a VU-style meter reads just as usable at 30fps as 60fps, so halving the rate here is
+     * a real reduction in steady-state load for no visible cost, unlike trimming anything on
+     * the recording-critical path itself.
+     *
+     * Tied to *preview* lifecycle (started in [attachPreviewSurface], stopped in
+     * [detachPreviewSurface]), not recording — so the meter is usable for a sound check
+     * before REC, matching [RecordingPipeline.ensureAudioEngineStarted]'s doc for why the
+     * native audio engine itself now also starts at preview time. No-op if already running
+     * (idempotent, mirroring the pipeline side) since [attachPreviewSurface] can re-enter
+     * this while a recording is already in progress (viewfinder reattaching).
      */
     private fun startMeterPolling() {
+        if (meterJob != null) return
         meterJob = viewModelScope.launch {
             while (isActive) {
-                delay(16L)
+                delay(33L)
                 val peakL = pipeline.nativeEngine.peakDb(CHANNEL_LEFT)
                 val peakR = pipeline.nativeEngine.peakDb(CHANNEL_RIGHT)
                 val rmsL = pipeline.nativeEngine.rmsDb(CHANNEL_LEFT)
@@ -488,6 +622,19 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
                     )
                 }
             }
+        }
+    }
+
+    private fun stopMeterPolling() {
+        meterJob?.cancel()
+        meterJob = null
+        lastClippingDetectedMsL = 0L
+        lastClippingDetectedMsR = 0L
+        _uiState.update {
+            it.copy(
+                peakDbL = -120f, peakDbR = -120f, rmsDbL = -120f, rmsDbR = -120f,
+                isClippingHeldL = false, isClippingHeldR = false,
+            )
         }
     }
 
@@ -528,6 +675,7 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         super.onCleared()
         thermalMonitor.stop()
         stopRecordingJobs()
+        meterJob?.cancel(); meterJob = null
         pipeline.stopAll()
         // Best-effort hygiene: if the ViewModel is torn down while the foreground service
         // is up (this is itself the process-death/task-swipe scenario RecordingService's
@@ -553,6 +701,48 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         fps = this.selectedVideoConfig?.frameRate ?: this.fps,
         zoomRatio = this.zoomRatio,
     )
+
+    /**
+     * The subset of [CameraUiState] that [UserPreferencesStore] actually persists, used as
+     * an equality-comparable key for the auto-save debounce (see [init]'s doc for why the
+     * raw state flow can't be debounced directly — the audio meter fields update ~30x/sec
+     * for as long as preview is up and would otherwise mean the debounce window never
+     * closes). Deliberately excludes everything telemetry/derived: peakDb/rmsDb, thermal
+     * status, elapsed time, xrun/overrun counts, capabilities, availableLenses, etc.
+     */
+    private data class PersistSnapshot(
+        val lensCameraId: String?,
+        val iso: Int,
+        val exposureTimeNanos: Long,
+        val zoomRatio: Float,
+        val kelvin: Double,
+        val wbAuto: Boolean,
+        val afAuto: Boolean,
+        val frameLineAspectRatio: FrameLineAspectRatio,
+        val inputGainDb: Float,
+        val monitoringEnabled: Boolean,
+        val storageLocation: StorageLocation,
+        val segmentDurationMinutes: Int,
+        val videoConfig: CameraCapabilityInspector.VideoConfigCandidate?,
+        val eqBands: List<EqBandState>,
+    ) {
+        constructor(state: CameraUiState) : this(
+            lensCameraId = state.selectedLensCameraId,
+            iso = state.iso,
+            exposureTimeNanos = state.exposureTimeNanos,
+            zoomRatio = state.zoomRatio,
+            kelvin = state.kelvin,
+            wbAuto = state.wbAuto,
+            afAuto = state.afAuto,
+            frameLineAspectRatio = state.settings.frameLineAspectRatio,
+            inputGainDb = state.inputGainDb,
+            monitoringEnabled = state.monitoringEnabled,
+            storageLocation = state.settings.storageLocation,
+            segmentDurationMinutes = state.settings.segmentDurationMinutes,
+            videoConfig = state.selectedVideoConfig,
+            eqBands = state.eqBands,
+        )
+    }
 
     private companion object {
         const val TAG = "CameraControlViewModel"

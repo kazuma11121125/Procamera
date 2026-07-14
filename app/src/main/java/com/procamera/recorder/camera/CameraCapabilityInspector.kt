@@ -215,16 +215,17 @@ class CameraCapabilityInspector(private val cameraManager: CameraManager) {
      *
      * [equivalentFocalLengthMm] is the 35mm-film-equivalent focal length computed via
      * the same formula used in [findStandardRearLens]: `physicalFocalLength × (43.27 /
-     * sensorDiagonalMm)`.  [zoomLabel] is derived from `equivalentFocalLengthMm / 28`
-     * and formatted as "0.6x", "1x", "2x", etc. (see [allRearLenses] for rounding
-     * rules).  [maxDigitalZoom] is read directly from
-     * `SCALER_AVAILABLE_MAX_DIGITAL_ZOOM` — defaulting to 1f if absent — and caps the
-     * zoom range that the pinch-to-zoom gesture exposes for this lens.
+     * sensorDiagonalMm)`.  [zoomLabel] is the rounded 35mm-equivalent focal length itself
+     * (e.g. "16mm", "28mm", "85mm") — mm rather than an "×" multiplier, per feedback from
+     * real-device use: a photographer reading a lens strip thinks in focal length, not a
+     * ratio against whatever the "standard" lens happens to be. [maxDigitalZoom] is read
+     * directly from `SCALER_AVAILABLE_MAX_DIGITAL_ZOOM` — defaulting to 1f if absent — and
+     * caps the zoom range that the pinch-to-zoom gesture exposes for this lens.
      */
     data class AvailableLens(
         val cameraId: String,
         val equivalentFocalLengthMm: Float,
-        val zoomLabel: String,         // e.g. "0.6x", "1x", "2x"
+        val zoomLabel: String,         // e.g. "16mm", "28mm", "85mm"
         val isStandardLens: Boolean,
         val hardwareLevel: Int,
         val maxDigitalZoom: Float,     // from SCALER_AVAILABLE_MAX_DIGITAL_ZOOM
@@ -239,13 +240,6 @@ class CameraCapabilityInspector(private val cameraManager: CameraManager) {
      * This is the source of truth for the lens-switcher strip: the UI renders one button
      * per element, highlights [AvailableLens.isStandardLens], and uses
      * [AvailableLens.zoomLabel] as the button label.
-     *
-     * **zoom-label rounding rules**
-     * - ratio < (1.0 − 0.15) → "%.1fx" (one decimal, e.g. "0.6x")
-     * - |ratio − 1.0| ≤ 0.15 → "1x"  (exact label, no decimal)
-     * - ratio > (1.0 + 0.15) → "%.0fx" (no decimal, e.g. "2x", "5x")
-     *
-     * where `ratio = equivalentFocalLengthMm / 28.0`.
      */
     fun allRearLenses(): List<AvailableLens> {
         val standardCameraId = findStandardRearLens()?.cameraId
@@ -267,13 +261,7 @@ class CameraCapabilityInspector(private val cameraManager: CameraManager) {
             if (sensorDiagonalMm < MIN_PLAUSIBLE_MAIN_SENSOR_DIAGONAL_MM && !isRunningOnEmulator()) return@mapNotNull null
 
             val equivalentFocalLengthMm = focalLength * (FULL_FRAME_DIAGONAL_MM / sensorDiagonalMm)
-
-            val ratio = equivalentFocalLengthMm / NORMAL_LENS_EQUIVALENT_MM
-            val zoomLabel = when {
-                ratio < 0.85f -> "%.1fx".format(ratio)  // ultra-wide, e.g. "0.6x"
-                ratio <= 1.15f -> "1x"                   // within ±15% of 28mm → "1x"
-                else -> "%.0fx".format(ratio)            // telephoto, e.g. "2x", "5x"
-            }
+            val zoomLabel = "%.0fmm".format(equivalentFocalLengthMm)
 
             AvailableLens(
                 cameraId = id,

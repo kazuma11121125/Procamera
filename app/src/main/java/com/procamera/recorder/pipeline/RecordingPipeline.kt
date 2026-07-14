@@ -87,6 +87,11 @@ class RecordingPipeline(private val context: Context) {
         val hardwareLevel: Int,
         val videoConfig: CameraCapabilityInspector.VideoConfigCandidate,
         val cameraId: String,
+        /** `LENS_INFO_AVAILABLE_APERTURES`'s smallest (widest) value — display-only, per
+         * real-device feedback (phone lenses are fixed-aperture, so there is nothing to
+         * control, but the F-number itself is still useful readout for a photographer).
+         * Null if the characteristic is absent. */
+        val apertureFNumber: Float?,
     )
 
     // ──────────────────────────────────────────────────────────────────────────────
@@ -111,10 +116,33 @@ class RecordingPipeline(private val context: Context) {
 
     /**
      * Exposed so the ViewModel can poll [NativeEngineBridge.peakDb]/[NativeEngineBridge.rmsDb]
-     * and update the audio meter StateFlow at ~60 fps. The engine is started in
-     * [startRecording] and stopped in [stopRecordingInternal].
+     * and update the audio meter StateFlow at ~60 fps. Started via [ensureAudioEngineStarted]
+     * as soon as preview begins (not just recording) so the meter is usable for a sound
+     * check before REC — kept running across preview↔recording transitions (recording just
+     * attaches an [AudioEncoder] to drain it) and only actually stopped in [stopAll] or when
+     * preview itself is torn down without a recording in progress (see
+     * [detachPreviewSurface]). RECORD_AUDIO is already granted before preview starts
+     * (MainActivity requests CAMERA+RECORD_AUDIO together up front), so no permission-flow
+     * change is needed for this.
      */
     val nativeEngine = NativeEngineBridge()
+    private var audioEngineActive = false
+
+    /** Idempotent: safe to call even if already running (e.g. recording starting from an
+     * already-active preview). */
+    private fun ensureAudioEngineStarted(): String? {
+        if (audioEngineActive) return null
+        val error = nativeEngine.start()
+        if (error == null) audioEngineActive = true
+        return error
+    }
+
+    private fun stopAudioEngineIfActive() {
+        if (audioEngineActive) {
+            nativeEngine.stop()
+            audioEngineActive = false
+        }
+    }
 
     // ──────────────────────────────────────────────────────────────────────────────
     // State preserved across recording cycles
@@ -163,6 +191,7 @@ class RecordingPipeline(private val context: Context) {
     suspend fun startPreview(
         surface: Surface?,
         params: CameraParams = currentParams,
+        targetCameraId: String? = null,
     ): CameraCapabilities? = sessionMutex.withLock {
         if (pipelineState == PipelineState.RECORDING) {
             // Preview surface (re)attach while a recording is already in progress — e.g.
@@ -179,8 +208,23 @@ class RecordingPipeline(private val context: Context) {
         if (pipelineState == PipelineState.PREVIEWING) stopPreviewSession()
 
         try {
-            val lens = capabilityInspector.findStandardRearLens()
-                ?: error("No standard rear lens found on this device")
+            // [targetCameraId] lets a caller (CameraControlViewModel.switchLens) open a
+            // *specific* rear lens instead of always falling back to the standard one.
+            // Before this parameter existed, switchLens() had no way to communicate which
+            // lens it wanted — startPreview() would silently reopen findStandardRearLens()
+            // every time regardless of which AvailableLens the user tapped, so the lens
+            // selector UI updated its own highlighted state but the actual camera session
+            // never changed (real-device finding: lens buttons appeared to do nothing).
+            val lens = if (targetCameraId != null) {
+                CameraCapabilityInspector.LensInfo(
+                    cameraId = targetCameraId,
+                    focalLengthMm = 0f,
+                    isStandardRearLens = false,
+                )
+            } else {
+                capabilityInspector.findStandardRearLens()
+                    ?: error("No standard rear lens found on this device")
+            }
 
             // Default candidate for the CameraCapabilities snapshot (used to populate slider
             // ranges etc.). The user's actual Settings selection (selectVideoConfig()) is
@@ -210,6 +254,9 @@ class RecordingPipeline(private val context: Context) {
                 hardwareLevel = capabilityInspector.hardwareLevel(lens.cameraId),
                 videoConfig = videoConfig,
                 cameraId = lens.cameraId,
+                apertureFNumber = characteristics.get(
+                    android.hardware.camera2.CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES,
+                )?.minOrNull(),
             )
 
             selectedLens = lens
@@ -257,6 +304,14 @@ class RecordingPipeline(private val context: Context) {
                     params = params,
                 )
                 pipelineState = PipelineState.PREVIEWING
+
+                // Best-effort: a broken/busy mic shouldn't fail the whole preview (the
+                // camera side is still useful on its own) — the meter will just read
+                // silence-floor if this fails, same as it would look before this method
+                // existed. startRecording() calls the same idempotent helper and DOES
+                // surface a failure, since recording without audio is a harder failure.
+                val audioError = ensureAudioEngineStarted()
+                if (audioError != null) Log.w(TAG, "Audio engine failed to start during preview: $audioError")
             }
 
             Log.i(TAG, "Preview started: cameraId=${lens.cameraId} videoConfig=$videoConfig")
@@ -344,7 +399,7 @@ class RecordingPipeline(private val context: Context) {
             )
             videoEncoder = video
 
-            val engineError = nativeEngine.start()
+            val engineError = ensureAudioEngineStarted()
             if (engineError != null) error("Audio engine failed to start: $engineError")
 
             val audio = AudioEncoder(
@@ -404,9 +459,11 @@ class RecordingPipeline(private val context: Context) {
      * the preview-only session so the viewfinder stays live. Must be called from a
      * coroutine; `awaitEndOfStream()` blocks until the VideoEncoder is fully drained.
      *
-     * The stop order follows docs/ARCHITECTURE.md §Phase4's stop-sequence rationale:
-     * both capture sources (camera + microphone) are stopped back-to-back, THEN encoders
-     * are drained — keeping the Audio tail ≤ 0.75s per the real-device measurement.
+     * The stop order follows docs/ARCHITECTURE.md §Phase4's stop-sequence rationale
+     * (camera session stops, THEN encoders are drained — keeping the Audio tail ≤ 0.75s
+     * per the real-device measurement). The audio *engine* itself (the mic) is no longer
+     * part of this stop sequence — see [ensureAudioEngineStarted]'s doc for why it now
+     * outlives individual recordings, for continuous metering.
      */
     suspend fun stopRecording() {
         if (pipelineState != PipelineState.RECORDING) return
@@ -439,6 +496,10 @@ class RecordingPipeline(private val context: Context) {
             reconfigureRecordingSurfacesLocked()
         } else {
             stopPreviewSession()
+            // Only here: leaving preview with no recording in progress is the one case
+            // where nothing still needs the mic (see ensureAudioEngineStarted's doc) — stop
+            // it so it doesn't stay hot while backgrounded.
+            stopAudioEngineIfActive()
         }
     }
 
@@ -465,6 +526,7 @@ class RecordingPipeline(private val context: Context) {
             if (gotLock) sessionMutex.unlock()
         }
         nativeEngine.close()
+        audioEngineActive = false
         pipelineState = PipelineState.IDLE
     }
 
@@ -547,9 +609,13 @@ class RecordingPipeline(private val context: Context) {
 
     /** Caller must already hold [sessionMutex] (see the two suspend wrappers and [stopAll]). */
     private fun stopRecordingInternalLocked(restartPreview: Boolean) {
-        // Stop both capture sources back-to-back (see stop-sequence doc above).
+        // Camera session stops (see stop-sequence doc above); the audio *engine* deliberately
+        // does NOT stop here anymore — it keeps running for the meter across the return to
+        // Previewing (see [ensureAudioEngineStarted]'s doc). Only the AudioEncoder's drain
+        // (just below) stops consuming from it; the underlying ring buffer harmlessly
+        // wraps/overruns in the meantime, which does not affect this recording's already
+        // in-flight drain/EOS sequence (see ensureAudioEngineStarted's doc for the split).
         sessionController.stop()
-        nativeEngine.stop()
 
         videoEncoder?.let { encoder ->
             encoder.signalEndOfStream()

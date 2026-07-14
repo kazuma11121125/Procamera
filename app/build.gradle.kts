@@ -64,6 +64,14 @@ android {
         }
         release {
             isMinifyEnabled = false
+            // Debug-signed so this build type is directly `adb install`-able for local
+            // on-device perf comparisons (real-device "モッサリ" investigation: debug's
+            // isDebuggable=true disables several ART JIT optimizations independent of any
+            // app-code fix, so testing whether release actually feels smoother is the
+            // fastest way to tell how much of the sluggishness is debug-build overhead vs.
+            // genuine SoC thermal throttling). Replace with a real release signingConfig
+            // before this build type is ever used for an actual distributable artifact.
+            signingConfig = signingConfigs.getByName("debug")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             externalNativeBuild {
                 cmake {

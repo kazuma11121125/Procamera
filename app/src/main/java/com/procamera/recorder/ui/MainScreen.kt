@@ -56,6 +56,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.procamera.recorder.ui.components.FrameLineOverlay
+import com.procamera.recorder.ui.components.HistogramOverlay
 import com.procamera.recorder.ui.components.LevelGaugeOverlay
 import com.procamera.recorder.ui.components.StereoAudioMeter
 import com.procamera.recorder.ui.components.FocusSlider
@@ -200,6 +201,19 @@ fun MainScreen(
                     isClippingHeldR = state.isClippingHeldR,
                 )
             }
+
+            // Histogram — bottom-left: the one remaining corner clear of the audio meter
+            // (top-left), level gauge (center), control sidebar (right), and REC status
+            // (bottom-center). Always visible (not gated on state.showControls) to match
+            // the other measurement overlays, though it stops updating once a recording
+            // starts (self-hides via the null check — see HistogramOverlay's doc).
+            HistogramOverlay(
+                bins = state.histogramBins,
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .navigationBarsPadding()
+                    .padding(start = 8.dp, bottom = 12.dp),
+            )
 
             // Top status overlay on the preview.
             androidx.compose.animation.AnimatedVisibility(

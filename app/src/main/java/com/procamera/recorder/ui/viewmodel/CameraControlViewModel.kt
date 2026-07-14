@@ -111,6 +111,9 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
         }
+        pipeline.onHistogramUpdated = { bins ->
+            _uiState.update { it.copy(histogramBins = bins) }
+        }
         pipeline.onAutoFocusMeasured = { focus ->
             lastAutoFocus = focus
             if (_uiState.value.afAuto) {

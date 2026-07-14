@@ -191,6 +191,11 @@ data class CameraUiState(
     // ── EQ ───────────────────────────────────────────────────────────────────
     val eqBands: List<EqBandState> = EqBandState.defaults(),
 
+    // ── Histogram (輝度分布グラフ, §UIアシスト) ──────────────────────────────────
+    // Null until the first sample arrives (preview-only — see LuminanceHistogramReader's
+    // doc for why it's absent while a recording is in progress).
+    val histogramBins: FloatArray? = null,
+
     // ── Storage / performance ─────────────────────────────────────────────────
     val storageRemainingSeconds: Long = Long.MAX_VALUE,
 

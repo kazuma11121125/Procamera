@@ -305,14 +305,53 @@ class RecordingPipeline(private val context: Context) {
                 }
             }
 
+            // Histogram sampler (Sony__________.pdf's "ヒストグラム(輝度分布グラフ)" UI
+            // assist) — preview-only best-effort extra stream, see
+            // LuminanceHistogramReader's doc for why it's deliberately tiny/throttled and
+            // never added to the recording session. A fresh reader is created per
+            // startPreview() call (lens may have changed, and YUV sizes are per-camera).
+            histogramReader?.close()
+            histogramReader = com.procamera.recorder.camera.LuminanceHistogramReader.smallestYuvSize(characteristics)
+                ?.let { size ->
+                    try {
+                        com.procamera.recorder.camera.LuminanceHistogramReader(size.width, size.height) { bins ->
+                            Handler(Looper.getMainLooper()).post { onHistogramUpdated?.invoke(bins) }
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Histogram reader creation failed, continuing without it", e)
+                        null
+                    }
+                }
+
             // If no surface is available yet, defer actually opening the session.
             if (surface != null) {
-                sessionController.startRepeating(
-                    cameraId = lens.cameraId,
-                    outputSurfaces = listOf(surface),
-                    requestFactory = requireNotNull(requestFactory),
-                    params = params,
-                )
+                try {
+                    sessionController.startRepeating(
+                        cameraId = lens.cameraId,
+                        outputSurfaces = listOfNotNull(surface, histogramReader?.surface),
+                        requestFactory = requireNotNull(requestFactory),
+                        params = params,
+                    )
+                } catch (e: Exception) {
+                    if (histogramReader != null) {
+                        // The 3-stream combo (preview + histogram) isn't guaranteed
+                        // supported on every device — real-device testing already found
+                        // this exact camera rejects some concurrent stream combos outright
+                        // (see supportedVideoConfigs()'s 3840x2880 doc). Retry preview-only
+                        // rather than losing the whole preview over a UI-assist extra.
+                        Log.w(TAG, "Preview session with histogram stream failed, retrying without it", e)
+                        histogramReader?.close()
+                        histogramReader = null
+                        sessionController.startRepeating(
+                            cameraId = lens.cameraId,
+                            outputSurfaces = listOf(surface),
+                            requestFactory = requireNotNull(requestFactory),
+                            params = params,
+                        )
+                    } else {
+                        throw e
+                    }
+                }
                 pipelineState = PipelineState.PREVIEWING
 
                 // Best-effort: a broken/busy mic shouldn't fail the whole preview (the
@@ -544,6 +583,8 @@ class RecordingPipeline(private val context: Context) {
         }
         nativeEngine.close()
         orientationTracker.stop()
+        histogramReader?.close()
+        histogramReader = null
         audioEngineActive = false
         pipelineState = PipelineState.IDLE
     }

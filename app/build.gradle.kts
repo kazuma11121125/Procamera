@@ -38,6 +38,14 @@ android {
     buildTypes {
         debug {
             isDebuggable = true
+            // x86_64 is added here (debug-only) so the app's native (Oboe/JNI) libs can load
+            // on the standard x86_64 emulator system image used for local/CI emulator
+            // verification. This matches the judgment log's intent (docs/ARCHITECTURE.md
+            // §前提・判断ログ #6: "x86_64はエミュレータ検証時のみ補助的に含める") — release
+            // and the base defaultConfig ABI set remain arm64-v8a only.
+            ndk {
+                abiFilters += "x86_64"
+            }
             externalNativeBuild {
                 cmake {
                     // ASan/UBSan are debug-only per spec §4.6; see cpp/CMakeLists.txt

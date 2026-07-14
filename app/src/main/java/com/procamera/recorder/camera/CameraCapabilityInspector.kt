@@ -80,11 +80,20 @@ class CameraCapabilityInspector(private val cameraManager: CameraManager) {
                 hardwareLevel = hardwareLevel(id),
                 sensorDiagonalMm = sensorDiagonalMm,
             )
-        }.filter { it.sensorDiagonalMm >= MIN_PLAUSIBLE_MAIN_SENSOR_DIAGONAL_MM }
+        }
 
-        if (candidates.isEmpty()) return null
+        // The AVD's emulated camera HAL reports an implausibly tiny sensor (observed:
+        // 3.2x2.4mm, diagonal 4.0mm on the API34 google_apis x86_64 image) that fails the
+        // real-device-tuned plausibility floor below, which would otherwise make this
+        // return null on every emulator and block all camera-pipeline testing there. Only
+        // fall back to skipping the floor when isPlausibleFloorFiltered leaves nothing AND
+        // we're actually on an emulator — real devices always go through the strict path.
+        val plausible = candidates.filter { it.sensorDiagonalMm >= MIN_PLAUSIBLE_MAIN_SENSOR_DIAGONAL_MM }
+        val filtered = if (plausible.isEmpty() && isRunningOnEmulator()) candidates else plausible
 
-        val standard = candidates
+        if (filtered.isEmpty()) return null
+
+        val standard = filtered
             .sortedWith(
                 compareByDescending<RearCandidate> { it.isLogicalMultiCamera }
                     .thenByDescending { it.hardwareLevel == CameraMetadata.INFO_SUPPORTED_HARDWARE_LEVEL_FULL }
@@ -253,7 +262,9 @@ class CameraCapabilityInspector(private val cameraManager: CameraManager) {
 
             // Same formula as findStandardRearLens: 35mm-equivalent = focal × (43.27 / diagonal)
             val sensorDiagonalMm = kotlin.math.hypot(sensorSize.width, sensorSize.height)
-            if (sensorDiagonalMm < MIN_PLAUSIBLE_MAIN_SENSOR_DIAGONAL_MM) return@mapNotNull null
+            // See findStandardRearLens's isRunningOnEmulator comment: the AVD's fake sensor
+            // fails this floor, so it only applies on real hardware.
+            if (sensorDiagonalMm < MIN_PLAUSIBLE_MAIN_SENSOR_DIAGONAL_MM && !isRunningOnEmulator()) return@mapNotNull null
 
             val equivalentFocalLengthMm = focalLength * (FULL_FRAME_DIAGONAL_MM / sensorDiagonalMm)
 
@@ -325,6 +336,24 @@ class CameraCapabilityInspector(private val cameraManager: CameraManager) {
         val characteristics = cameraManager.getCameraCharacteristics(cameraId)
         return characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
     }
+
+    /**
+     * Standard `Build` fingerprint heuristics for "is this the Android emulator" (the same
+     * signals used by, e.g., Firebase/Play Integrity emulator detection). Only used to relax
+     * the sensor-plausibility floor above, which is tuned against real hardware and always
+     * false-positives on the AVD's synthetic camera HAL — never gates any user-facing
+     * recording behavior.
+     */
+    private fun isRunningOnEmulator(): Boolean =
+        Build.FINGERPRINT.startsWith("generic") ||
+            Build.FINGERPRINT.startsWith("unknown") ||
+            Build.MODEL.contains("google_sdk") ||
+            Build.MODEL.contains("Emulator") ||
+            Build.MODEL.contains("Android SDK built for") ||
+            Build.MANUFACTURER.contains("Genymotion") ||
+            Build.PRODUCT.contains("sdk") ||
+            Build.HARDWARE.contains("goldfish") ||
+            Build.HARDWARE.contains("ranchu")
 
     private companion object {
         const val FULL_FRAME_DIAGONAL_MM = 43.27f

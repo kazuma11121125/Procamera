@@ -163,11 +163,17 @@ class RecordingPipeline(private val context: Context) {
             // consulted later, at encoder-creation time in startRecording() — preview doesn't
             // care about the eventual encoder's resolution, so there is no need to restart
             // the preview session just because the user picked a different video config.
+            // §1.2's primary/fallback pair (4K HEVC / 1080p60 H.264) covers the capable real
+            // devices this app targets. If neither is actually encodable (e.g. a software
+            // encoder capped below 60fps, as on the emulator's swiftshader codec), fall back
+            // to the broader candidate list built for the Settings resolution picker rather
+            // than failing outright — better to record at a lower spec than not at all.
             val videoConfig = capabilityInspector.videoConfigCandidates().firstOrNull {
                 capabilityInspector.isVideoConfigSupported(
                     it.mimeType, it.width, it.height, it.frameRate, it.bitrate,
                 )
-            } ?: error("No supported video config (checked HEVC 4K30 and H.264 1080p60)")
+            } ?: capabilityInspector.supportedVideoConfigs(lens.cameraId).firstOrNull()
+                ?: error("No supported video config (checked HEVC 4K30, H.264 1080p60, and the broader fallback list)")
 
             val characteristics = sessionController.characteristicsFor(lens.cameraId)
             val clamper = CaptureRangeClamper.fromCharacteristics(characteristics)

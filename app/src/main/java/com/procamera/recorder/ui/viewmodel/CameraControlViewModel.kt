@@ -211,6 +211,15 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         if (_uiState.value.recordingState != RecordingUiState.Previewing) return
         _uiState.update { it.copy(recordingState = RecordingUiState.StartingRecording) }
 
+        // Started here, before the (async) pipeline build, not on Event.Started: a
+        // camera|microphone foreground service must be started while the app is still
+        // in the foreground (the REC tap itself) — on API 31+, starting one from
+        // background can throw ForegroundServiceStartNotAllowedException. On a slow
+        // real-device pipeline build, the user could background the app mid-setup before
+        // Event.Started ever fires, missing that window. A brief notification flash on
+        // immediate failure is an acceptable trade-off (handled in the Failed branch).
+        startRecordingService()
+
         viewModelScope.launch {
             pipeline.startRecording { event ->
                 when (event) {
@@ -227,7 +236,6 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
                             )
                         }
                         startRecordingJobs()
-                        startRecordingService()
                     }
                     is RecordingPipeline.Event.Failed -> {
                         _uiState.update {

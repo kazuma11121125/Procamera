@@ -395,7 +395,7 @@ class RecordingPipeline(private val context: Context) {
         } catch (e: Exception) {
             Log.e(TAG, "startRecording failed", e)
             onEvent(Event.Failed(e.message ?: e.toString()))
-            stopRecordingInternal(restartPreview = false)
+            sessionMutex.withLock { stopRecordingInternalLocked(restartPreview = false) }
         }
     }
 
@@ -410,7 +410,7 @@ class RecordingPipeline(private val context: Context) {
      */
     suspend fun stopRecording() {
         if (pipelineState != PipelineState.RECORDING) return
-        stopRecordingInternal(restartPreview = true)
+        sessionMutex.withLock { stopRecordingInternalLocked(restartPreview = true) }
     }
 
     /**
@@ -446,11 +446,24 @@ class RecordingPipeline(private val context: Context) {
      * Stops everything (preview + recording if active). Call from `ViewModel.onCleared()`.
      */
     fun stopAll() {
-        if (pipelineState == PipelineState.RECORDING) {
-            stopRecordingInternal(restartPreview = false)
+        // Non-suspend (called synchronously from ViewModel.onCleared(), where
+        // viewModelScope is already being torn down — launching a coroutine to properly
+        // await sessionMutex there is unreliable). tryLock() instead: normally acquires
+        // immediately since nothing else should be mid-reconfiguration at teardown time;
+        // if something IS holding it (e.g. a screen-lock reconfiguration racing the
+        // ViewModel's own destruction), proceed anyway and log — this is unconditional
+        // teardown, so blocking indefinitely here would be worse than a logged race.
+        val gotLock = sessionMutex.tryLock()
+        if (!gotLock) Log.w(TAG, "stopAll(): sessionMutex busy, proceeding without it")
+        try {
+            if (pipelineState == PipelineState.RECORDING) {
+                stopRecordingInternalLocked(restartPreview = false)
+            }
+            stopPreviewSession()
+            sessionController.release()
+        } finally {
+            if (gotLock) sessionMutex.unlock()
         }
-        stopPreviewSession()
-        sessionController.release()
         nativeEngine.close()
         pipelineState = PipelineState.IDLE
     }
@@ -497,7 +510,8 @@ class RecordingPipeline(private val context: Context) {
     // Internal helpers
     // ──────────────────────────────────────────────────────────────────────────────
 
-    private fun stopRecordingInternal(restartPreview: Boolean) {
+    /** Caller must already hold [sessionMutex] (see the two suspend wrappers and [stopAll]). */
+    private fun stopRecordingInternalLocked(restartPreview: Boolean) {
         // Stop both capture sources back-to-back (see stop-sequence doc above).
         sessionController.stop()
         nativeEngine.stop()

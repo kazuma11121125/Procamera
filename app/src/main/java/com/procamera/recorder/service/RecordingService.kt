@@ -60,7 +60,13 @@ class RecordingService : Service() {
             startForeground(NOTIFICATION_ID, notification)
         }
         acquireWakeLock()
-        return START_STICKY
+        // NOT_STICKY: this Service is purely slaved to the ViewModel-owned
+        // RecordingPipeline and is started explicitly on each recording. If the process
+        // is killed and the OS restarts this Service on its own (START_STICKY's whole
+        // point), there is no pipeline left to attach to — that would resurrect a
+        // "録画中…" notification + wake lock for a recording that no longer exists. Don't
+        // resurrect a service with nothing to serve.
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {

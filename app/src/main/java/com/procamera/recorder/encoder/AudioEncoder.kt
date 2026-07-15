@@ -49,19 +49,26 @@ class AudioEncoder(
     }
 
     /**
-     * Starts the encoder and the drain thread. Seeds [ptsClockDomain]'s audio anchor via
-     * [PtsClockDomain.startAudioAnchorFromFrameCorrelation] itself (retrying against
-     * [NativeEngineBridge.getInputTimestamp] — see its doc for why a raw
-     * `startAudioAnchor()` call must not be substituted here, since that would silently
-     * reintroduce the input-latency offset the frame-correlation path exists to remove).
-     * Callers must ensure [nativeEngine] is already started (audio callbacks flowing)
-     * before calling this, so a correlation becomes available within the retry budget.
+     * Starts the encoder and the drain thread. [seedAudioAnchor] (which retries against
+     * [NativeEngineBridge.getInputTimestamp] for frame-correlation accuracy — see its doc
+     * for why a raw `startAudioAnchor()` call must not be substituted there, since that
+     * would silently reintroduce the input-latency offset the frame-correlation path
+     * exists to remove) runs on [drainThread], not here: real-device finding — this
+     * caller is [com.procamera.recorder.pipeline.RecordingPipeline.startRecording], which
+     * runs the camera session reconfiguration right after this call returns, so blocking
+     * here for the anchor's up-to-~2s retry budget delayed that reconfiguration by the
+     * same amount, showing up as the first few seconds of video being frozen/blacked out
+     * after tapping record. Callers must ensure [nativeEngine] is already started (audio
+     * callbacks flowing) before calling this, so a correlation becomes available within
+     * the retry budget.
      */
     fun start() {
         codec.start()
-        seedAudioAnchor()
         running.set(true)
-        drainThread = thread(name = "AudioEncoderDrain", priority = Thread.NORM_PRIORITY) { drainLoop() }
+        drainThread = thread(name = "AudioEncoderDrain", priority = Thread.NORM_PRIORITY) {
+            seedAudioAnchor()
+            drainLoop()
+        }
     }
 
     /**
@@ -131,46 +138,61 @@ class AudioEncoder(
         val byteScratch = java.nio.ByteBuffer.allocateDirect(shortScratch.size * 2).order(java.nio.ByteOrder.LITTLE_ENDIAN)
         val bufferInfo = MediaCodec.BufferInfo()
 
+        // One drain+encode attempt. Returns false only when the ring buffer was empty (the
+        // "nothing left to do right now" case both the steady-state loop and the final
+        // drain below need to distinguish from "encoded a block, possibly non-monotonic").
+        fun drainOneBlock(): Boolean {
+            val framesRead = nativeEngine.drainEncoderBuffer(floatScratch, FRAMES_PER_BLOCK)
+            if (framesRead == 0) return false
+            val sampleCount = framesRead * channelCount
+
+            // In place on the reused scratch buffers, converting only the first
+            // sampleCount elements — framesRead is rarely a full FRAMES_PER_BLOCK (the
+            // native ring buffer's available frames vary block to block), so a naive
+            // size-matched output buffer would only ever be `shortScratch` itself on
+            // the rare exact-size block; every other block previously got a throwaway
+            // array that the read loop below never actually read from, silently
+            // feeding the encoder stale/reused shortScratch content instead of the
+            // just-converted samples (real-device finding: this is what made recorded
+            // audio sound like garbled noise rather than the captured signal).
+            PcmDither.floatToInt16Tpdf(floatScratch, shortScratch, sampleCount)
+
+            val ptsUs = ptsClockDomain.normalizeAudioPtsUs(cumulativeSampleCount, sampleRateHz)
+            cumulativeSampleCount += framesRead
+            if (ptsUs == null) {
+                // Non-monotonic (shouldn't happen for a purely-increasing counter, but
+                // guarded per §4.3) — logged rather than silently dropped: this exact
+                // silent path is what hid the seedAudioAnchor bug (see its doc) until a
+                // real-device file-level check caught the missing audio.
+                Log.w(TAG, "Audio frame dropped: PTS not monotonic (cumulativeSampleCount=$cumulativeSampleCount)")
+                return true
+            }
+
+            byteScratch.clear()
+            for (i in 0 until sampleCount) {
+                byteScratch.putShort(shortScratch[i])
+            }
+            byteScratch.flip()
+
+            queueInput(byteScratch, ptsUs, endOfStream = false)
+            return true
+        }
+
         try {
             while (running.get()) {
                 drainOutputAvailable(bufferInfo)
-
-                val framesRead = nativeEngine.drainEncoderBuffer(floatScratch, FRAMES_PER_BLOCK)
-                if (framesRead == 0) {
+                if (!drainOneBlock()) {
                     Thread.sleep(BUFFER_EMPTY_SLEEP_MS)
-                    continue
                 }
-                val sampleCount = framesRead * channelCount
+            }
 
-                // In place on the reused scratch buffers, converting only the first
-                // sampleCount elements — framesRead is rarely a full FRAMES_PER_BLOCK (the
-                // native ring buffer's available frames vary block to block), so a naive
-                // size-matched output buffer would only ever be `shortScratch` itself on
-                // the rare exact-size block; every other block previously got a throwaway
-                // array that the read loop below never actually read from, silently
-                // feeding the encoder stale/reused shortScratch content instead of the
-                // just-converted samples (real-device finding: this is what made recorded
-                // audio sound like garbled noise rather than the captured signal).
-                PcmDither.floatToInt16Tpdf(floatScratch, shortScratch, sampleCount)
-
-                val ptsUs = ptsClockDomain.normalizeAudioPtsUs(cumulativeSampleCount, sampleRateHz)
-                cumulativeSampleCount += framesRead
-                if (ptsUs == null) {
-                    // Non-monotonic (shouldn't happen for a purely-increasing counter, but
-                    // guarded per §4.3) — logged rather than silently dropped: this exact
-                    // silent path is what hid the seedAudioAnchor bug (see its doc) until a
-                    // real-device file-level check caught the missing audio.
-                    Log.w(TAG, "Audio frame dropped: PTS not monotonic (cumulativeSampleCount=$cumulativeSampleCount)")
-                    continue
-                }
-
-                byteScratch.clear()
-                for (i in 0 until sampleCount) {
-                    byteScratch.putShort(shortScratch[i])
-                }
-                byteScratch.flip()
-
-                queueInput(byteScratch, ptsUs, endOfStream = false)
+            // stop() flips `running` and returns immediately without waiting for the ring
+            // buffer to empty — real-device finding: without this, whatever was still
+            // buffered (the last ~0.1-0.5s in practice) got silently truncated instead of
+            // reaching the encoder. drainOutputAvailable keeps pace alongside so this
+            // doesn't exhaust MediaCodec's input buffer pool if the backlog is large.
+            while (drainOneBlock()) {
+                drainOutputAvailable(bufferInfo)
             }
 
             // Final EOS buffer, per §4.4's stop sequence (EOS -> drain all pending output -> stop/release).

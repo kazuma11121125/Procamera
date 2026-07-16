@@ -9,8 +9,9 @@ import android.view.OrientationEventListener
 import android.view.Surface
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
@@ -24,8 +25,9 @@ import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.rotate as drawRotate
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.procamera.recorder.ui.theme.MeterGreen
@@ -203,11 +205,22 @@ fun LevelGaugeOverlay(modifier: Modifier = Modifier) {
                 )
             }
         }
-        Text(
-            text = formatRollDegrees(rollDegrees),
-            color = if (isLevel) MeterGreen else OnSurfacePrimary,
-            fontSize = 10.sp,
-            fontWeight = FontWeight.Medium,
-        )
+        // Canvas-drawn (not Text()) — same real-device finding as AudioMeterBar's peak-dB
+        // label (see its doc): this string changes on every sensor tick (~15Hz), and a
+        // Compose Text() with per-tick-changing content pays for a full text-layout
+        // re-measure plus an accessibility semantics-tree update every time, confirmed via
+        // on-device atrace. nativeCanvas.drawText skips both.
+        val degreesTextPaint = remember {
+            android.graphics.Paint().apply {
+                textAlign = android.graphics.Paint.Align.CENTER
+                isAntiAlias = true
+            }
+        }
+        Canvas(modifier = Modifier.fillMaxWidth().height(14.dp)) {
+            degreesTextPaint.textSize = 10.sp.toPx()
+            degreesTextPaint.color = (if (isLevel) MeterGreen else OnSurfacePrimary).toArgb()
+            val baselineY = size.height / 2f - (degreesTextPaint.ascent() + degreesTextPaint.descent()) / 2f
+            drawContext.canvas.nativeCanvas.drawText(formatRollDegrees(rollDegrees), size.width / 2f, baselineY, degreesTextPaint)
+        }
     }
 }

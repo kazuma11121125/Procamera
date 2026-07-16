@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -69,14 +70,33 @@ fun AudioMeterBar(
         modifier = modifier,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text(
-            text = if (peakDb <= DB_FLOOR) "···" else formatDb(peakDb),
-            color = if (isClippingHeld) MeterRed else OnSurfacePrimary,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 9.sp,
-            fontWeight = FontWeight.Bold,
-            maxLines = 1,
-        )
+        // Canvas-drawn (not Text()) — real-device finding: a Compose Text() whose string
+        // content changes on every meter tick (~30Hz, since peakDb genuinely fluctuates
+        // that often) pays for a full text-layout re-measure AND an accessibility
+        // semantics-tree update on every single change — confirmed via on-device atrace:
+        // TextStringSimpleNode::measure/TextLayout:initLayout firing ~37/sec combined with
+        // LevelGaugeOverlay's equivalent live-value label, far more expensive than the
+        // actual Canvas bar redraw below it (which was already the intended lightweight
+        // path — see this file's class doc). nativeCanvas.drawText (same technique as
+        // DbScale's tick labels, just below) skips both costs. This label is decorative —
+        // the segmented bar is the actual signal — so losing per-value accessibility
+        // announcements here is an acceptable trade for a real-time meter readout.
+        val textColor = if (isClippingHeld) MeterRed else OnSurfacePrimary
+        val peakTextPaint = remember {
+            android.graphics.Paint().apply {
+                textAlign = android.graphics.Paint.Align.CENTER
+                isAntiAlias = true
+                typeface = android.graphics.Typeface.MONOSPACE
+                isFakeBoldText = true
+            }
+        }
+        Canvas(modifier = Modifier.fillMaxWidth().height(12.dp)) {
+            peakTextPaint.textSize = 9.sp.toPx()
+            peakTextPaint.color = textColor.toArgb()
+            val text = if (peakDb <= DB_FLOOR) "···" else formatDb(peakDb)
+            val baselineY = size.height / 2f - (peakTextPaint.ascent() + peakTextPaint.descent()) / 2f
+            drawContext.canvas.nativeCanvas.drawText(text, size.width / 2f, baselineY, peakTextPaint)
+        }
         Spacer(modifier = Modifier.height(2.dp))
         Box(
             modifier = Modifier

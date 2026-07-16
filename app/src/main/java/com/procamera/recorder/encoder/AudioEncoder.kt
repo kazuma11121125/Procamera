@@ -124,12 +124,33 @@ class AudioEncoder(
         ptsClockDomain.startAudioAnchor(nowNanos = fallbackAnchorNanos)
     }
 
-    /** Signals end-of-stream and waits for the drain thread to finish (§4.4's stop sequence). */
+    /**
+     * Signals end-of-stream and waits for the drain thread to finish (§4.4's stop sequence).
+     *
+     * Real-device finding (Sony SO-51C): this used to call `codec.stop()`/`codec.release()`
+     * itself right after a *timed* `join()`. `Thread.join(timeout)` returns whether or not
+     * the thread actually finished — under load (heavy background GC, muxer lock
+     * contention from [com.procamera.recorder.muxer.SegmentedMuxerController]'s shared
+     * lock — see its class doc) [drainThread]'s own post-EOS drain could still be mid
+     * `queueInput()`/`dequeueInputBuffer()` when the timeout elapsed, so the caller's
+     * `codec.release()` raced it and threw `IllegalStateException: codec is released
+     * already` from inside [queueInput] — reproduced twice on-device (once as a full ANR,
+     * since this runs on the caller's dispatcher, which for
+     * [com.procamera.recorder.pipeline.RecordingPipeline]'s current callers is the Main
+     * thread). Fixed by moving `codec.stop()`/`release()` into [drainLoop]'s own `finally`
+     * so only the thread that was still using the codec ever calls those on it. If
+     * [drainThread] is still alive after the timeout, this simply returns without touching
+     * the codec — it stays alive until the drain thread's own `finally` runs, which is a
+     * resource-lifetime delay, not a crash.
+     */
     fun stop() {
         running.set(false)
         drainThread?.join(DRAIN_THREAD_JOIN_TIMEOUT_MS)
-        codec.stop()
-        codec.release()
+        if (drainThread?.isAlive == true) {
+            Log.w(TAG, "AudioEncoderDrain still running after " +
+                "${DRAIN_THREAD_JOIN_TIMEOUT_MS}ms; leaving codec.stop()/release() to it " +
+                "instead of racing it from here")
+        }
     }
 
     private fun drainLoop() {
@@ -202,6 +223,12 @@ class AudioEncoder(
             drainOutputUntilEos(bufferInfo)
         } catch (e: Exception) {
             callback.onError(e)
+        } finally {
+            // Only this thread ever calls dequeue/queueInputBuffer, so it's the only safe
+            // owner of stop()/release() too — see [stop]'s doc for the cross-thread race
+            // this replaced.
+            codec.stop()
+            codec.release()
         }
     }
 

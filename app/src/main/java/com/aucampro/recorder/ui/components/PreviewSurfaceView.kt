@@ -1,4 +1,4 @@
-package com.procamera.recorder.ui.components
+package com.aucampro.recorder.ui.components
 
 import android.Manifest
 import android.view.SurfaceHolder
@@ -13,7 +13,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
-import com.procamera.recorder.ui.viewmodel.CameraControlViewModel
+import com.aucampro.recorder.ui.viewmodel.CameraControlViewModel
 
 /**
  * Compose wrapper around a [SurfaceView] that serves as the camera preview surface.
@@ -56,7 +56,7 @@ import com.procamera.recorder.ui.viewmodel.CameraControlViewModel
  *   [normalizedY] are [0,1] coordinates within *this composable's own rendered bounds*
  *   (the `PointerInputScope.size` this gesture detector sees, which is exactly the
  *   aspect-ratio-constrained `SurfaceView`'s box, not the wider outer preview area it
- *   may sit inside) — see [com.procamera.recorder.camera.TapToMeteringRegion]'s doc for
+ *   may sit inside) — see [com.aucampro.recorder.camera.TapToMeteringRegion]'s doc for
  *   why that's the contract the receiving end expects.
  */
 @androidx.annotation.RequiresPermission(Manifest.permission.CAMERA)

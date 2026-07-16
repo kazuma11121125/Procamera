@@ -1,11 +1,11 @@
-package com.procamera.recorder.encoder
+package com.aucampro.recorder.encoder
 
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.util.Log
-import com.procamera.recorder.audio.NativeEngineBridge
-import com.procamera.recorder.muxer.PtsClockDomain
+import com.aucampro.recorder.audio.NativeEngineBridge
+import com.aucampro.recorder.muxer.PtsClockDomain
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
@@ -54,7 +54,7 @@ class AudioEncoder(
      * for why a raw `startAudioAnchor()` call must not be substituted there, since that
      * would silently reintroduce the input-latency offset the frame-correlation path
      * exists to remove) runs on [drainThread], not here: real-device finding — this
-     * caller is [com.procamera.recorder.pipeline.RecordingPipeline.startRecording], which
+     * caller is [com.aucampro.recorder.pipeline.RecordingPipeline.startRecording], which
      * runs the camera session reconfiguration right after this call returns, so blocking
      * here for the anchor's up-to-~2s retry budget delayed that reconfiguration by the
      * same amount, showing up as the first few seconds of video being frozen/blacked out
@@ -74,7 +74,7 @@ class AudioEncoder(
     /**
      * Real-device finding: [NativeEngineBridge]'s input stream now outlives individual
      * recordings (started once at preview, kept running across record start/stop for
-     * continuous metering — see [com.procamera.recorder.pipeline.RecordingPipeline
+     * continuous metering — see [com.aucampro.recorder.pipeline.RecordingPipeline
      * .ensureAudioEngineStarted]'s doc). That means by the time a *second-or-later*
      * recording's [AudioEncoder] starts, the ring buffer can be holding a stale backlog —
      * up to its ~10s capacity, frozen there since nothing drained it during preview-only
@@ -130,13 +130,13 @@ class AudioEncoder(
      * Real-device finding (Sony SO-51C): this used to call `codec.stop()`/`codec.release()`
      * itself right after a *timed* `join()`. `Thread.join(timeout)` returns whether or not
      * the thread actually finished — under load (heavy background GC, muxer lock
-     * contention from [com.procamera.recorder.muxer.SegmentedMuxerController]'s shared
+     * contention from [com.aucampro.recorder.muxer.SegmentedMuxerController]'s shared
      * lock — see its class doc) [drainThread]'s own post-EOS drain could still be mid
      * `queueInput()`/`dequeueInputBuffer()` when the timeout elapsed, so the caller's
      * `codec.release()` raced it and threw `IllegalStateException: codec is released
      * already` from inside [queueInput] — reproduced twice on-device (once as a full ANR,
      * since this runs on the caller's dispatcher, which for
-     * [com.procamera.recorder.pipeline.RecordingPipeline]'s current callers is the Main
+     * [com.aucampro.recorder.pipeline.RecordingPipeline]'s current callers is the Main
      * thread). Fixed by moving `codec.stop()`/`release()` into [drainLoop]'s own `finally`
      * so only the thread that was still using the codec ever calls those on it. If
      * [drainThread] is still alive after the timeout, this simply returns without touching

@@ -5,7 +5,7 @@
 
 #include "dsp/PeakRmsMeter.h"
 
-using procamera::PeakRmsMeter;
+using aucampro::PeakRmsMeter;
 
 TEST(PeakRmsMeterTest, SineWaveConvergesToKnownRmsAndPeakDb) {
     constexpr double kSampleRate = 48000.0;

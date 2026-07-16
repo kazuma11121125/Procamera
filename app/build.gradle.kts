@@ -5,12 +5,12 @@ plugins {
 }
 
 android {
-    namespace = "com.procamera.recorder"
+    namespace = "com.aucampro.recorder"
     compileSdk = 36
     ndkVersion = libs.versions.ndk.get()
 
     defaultConfig {
-        applicationId = "com.procamera.recorder"
+        applicationId = "com.aucampro.recorder"
         minSdk = 29
         targetSdk = 36
         versionCode = 1
@@ -58,7 +58,7 @@ android {
                     // judgment log. Host GTest builds (app/src/main/cpp/test/CMakeLists.txt)
                     // remain ASan/UBSan-instrumented and unaffected by this. Re-enable once
                     // Phase4/5's wrap.sh task lands.
-                    arguments += listOf("-DPROCAMERA_ENABLE_SANITIZERS=OFF")
+                    arguments += listOf("-DAUCAMPRO_ENABLE_SANITIZERS=OFF")
                 }
             }
         }
@@ -75,7 +75,7 @@ android {
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             externalNativeBuild {
                 cmake {
-                    arguments += listOf("-DPROCAMERA_ENABLE_SANITIZERS=OFF")
+                    arguments += listOf("-DAUCAMPRO_ENABLE_SANITIZERS=OFF")
                 }
             }
         }

@@ -5,7 +5,7 @@
 
 #include "dsp/InputGain.h"
 
-using procamera::InputGain;
+using aucampro::InputGain;
 
 namespace {
 float dbToLinear(float db) { return std::pow(10.0f, db / 20.0f); }

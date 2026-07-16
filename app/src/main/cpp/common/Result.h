@@ -4,7 +4,7 @@
 #include <utility>
 #include <variant>
 
-namespace procamera {
+namespace aucampro {
 
 // std::expected is C++23; this project is pinned to C++20 and built with
 // -fno-exceptions (see app/build.gradle.kts), so this is a small, allocation-free
@@ -62,4 +62,4 @@ private:
     std::optional<E> error_;
 };
 
-}  // namespace procamera
+}  // namespace aucampro

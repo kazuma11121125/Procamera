@@ -1,4 +1,4 @@
-package com.procamera.recorder.encoder
+package com.aucampro.recorder.encoder
 
 import com.google.common.truth.Truth.assertThat
 import kotlin.random.Random

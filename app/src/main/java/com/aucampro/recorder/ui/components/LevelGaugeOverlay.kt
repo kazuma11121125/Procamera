@@ -1,4 +1,4 @@
-package com.procamera.recorder.ui.components
+package com.aucampro.recorder.ui.components
 
 import android.content.Context
 import android.hardware.Sensor
@@ -30,8 +30,8 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.procamera.recorder.ui.theme.MeterGreen
-import com.procamera.recorder.ui.theme.OnSurfacePrimary
+import com.aucampro.recorder.ui.theme.MeterGreen
+import com.aucampro.recorder.ui.theme.OnSurfacePrimary
 import kotlin.math.abs
 
 private const val LEVEL_THRESHOLD_DEGREES = 1.5f
@@ -42,7 +42,7 @@ private const val LEVEL_THRESHOLD_DEGREES = 1.5f
  * (`SENSOR_DELAY_UI`, tens of Hz), so the Formatter/Locale machinery `"%+.1f°".format(...)`
  * pulls in on every call was a real, measurable allocation hotspot (実機で発見: correlated
  * with GC-pressure-driven camera-pipeline frame-rate collapse — see
- * [com.procamera.recorder.encoder.VideoEncoder]'s `BufferInfo` reuse doc for the same
+ * [com.aucampro.recorder.encoder.VideoEncoder]'s `BufferInfo` reuse doc for the same
  * finding on the encoder side).
  */
 private fun formatRollDegrees(deg: Float): String {

@@ -1,4 +1,4 @@
-package com.procamera.recorder.service
+package com.aucampro.recorder.service
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -11,7 +11,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
-import com.procamera.recorder.ui.MainActivity
+import com.aucampro.recorder.ui.MainActivity
 
 /**
  * Foreground Service (`camera|microphone`) started for the duration of a recording so it
@@ -77,7 +77,7 @@ class RecordingService : Service() {
     private fun acquireWakeLock() {
         if (wakeLock?.isHeld == true) return
         val powerManager = getSystemService(POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ProCamera:RecordingWakeLock").apply {
+        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AuCamPRO:RecordingWakeLock").apply {
             setReferenceCounted(false)
             // Safety ceiling in case stopService()/onDestroy() is never reached (e.g. the
             // process is killed and restarted via START_STICKY with no recording to
@@ -101,7 +101,7 @@ class RecordingService : Service() {
             PendingIntent.FLAG_IMMUTABLE,
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("ProCamera")
+            .setContentTitle("AuCamPRO")
             .setContentText("録画中…")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setOngoing(true)

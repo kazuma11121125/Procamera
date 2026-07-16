@@ -4,7 +4,7 @@
 
 #include "common/TripleBuffer.h"
 
-using procamera::TripleBuffer;
+using aucampro::TripleBuffer;
 
 TEST(TripleBufferTest, ConsumeReturnsFalseWhenNothingPublishedYetSinceLastConsume) {
     TripleBuffer<int> tb;

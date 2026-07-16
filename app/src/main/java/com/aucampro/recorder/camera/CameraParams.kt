@@ -1,4 +1,4 @@
-package com.procamera.recorder.camera
+package com.aucampro.recorder.camera
 
 import android.graphics.Rect
 

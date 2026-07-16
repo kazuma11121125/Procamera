@@ -1,4 +1,4 @@
-package com.procamera.recorder.pipeline
+package com.aucampro.recorder.pipeline
 
 import android.Manifest
 import android.content.ContentValues
@@ -13,22 +13,27 @@ import android.provider.MediaStore
 import android.util.Log
 import android.view.Surface
 import androidx.annotation.RequiresPermission
-import com.procamera.recorder.audio.AudioDeviceRouter
-import com.procamera.recorder.audio.NativeEngineBridge
-import com.procamera.recorder.camera.CameraCapabilityInspector
-import com.procamera.recorder.camera.CameraParams
-import com.procamera.recorder.camera.CameraSessionController
-import com.procamera.recorder.camera.CaptureRangeClamper
-import com.procamera.recorder.camera.ColorTemperatureConverter
-import com.procamera.recorder.camera.ManualCaptureRequestFactory
-import com.procamera.recorder.encoder.AudioEncoder
-import com.procamera.recorder.encoder.VideoEncoder
-import com.procamera.recorder.muxer.PtsClockDomain
-import com.procamera.recorder.muxer.SegmentedMuxerController
-import com.procamera.recorder.ui.viewmodel.StorageLocation
+import com.aucampro.recorder.audio.AudioDeviceRouter
+import com.aucampro.recorder.audio.NativeEngineBridge
+import com.aucampro.recorder.camera.CameraCapabilityInspector
+import com.aucampro.recorder.camera.CameraParams
+import com.aucampro.recorder.camera.CameraSessionController
+import com.aucampro.recorder.camera.CaptureRangeClamper
+import com.aucampro.recorder.camera.ColorTemperatureConverter
+import com.aucampro.recorder.camera.ManualCaptureRequestFactory
+import com.aucampro.recorder.encoder.AudioEncoder
+import com.aucampro.recorder.encoder.VideoEncoder
+import com.aucampro.recorder.muxer.PtsClockDomain
+import com.aucampro.recorder.muxer.SegmentedMuxerController
+import com.aucampro.recorder.ui.viewmodel.StorageLocation
 import java.io.File
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -63,8 +68,17 @@ class RecordingPipeline(private val context: Context) {
     sealed interface Event {
         /** Emitted once the muxer is open and frames are being written. */
         data class Started(val outputDirectory: File) : Event
-        /** Emitted when a fatal error prevents recording from starting or continuing. */
-        data class Failed(val message: String) : Event
+        /**
+         * Emitted when a fatal error prevents recording from starting or continuing.
+         * [sessionStopped] is true when the camera session was actually torn down as part
+         * of handling this failure (a mid-recording encoder error, or an exception after
+         * the session was already reconfigured for recording) — the caller must call
+         * [startPreview] again to get the viewfinder back, the same way it would after a
+         * normal [stopRecording]. False for the early guard-clause failures (no lens/
+         * capabilities/etc. yet) where the existing preview session was never touched, so
+         * restarting it would just be an unnecessary session rebuild.
+         */
+        data class Failed(val message: String, val sessionStopped: Boolean = false) : Event
         /** Emitted after [stopRecording] successfully drains all encoders. */
         data object Stopped : Event
         /**
@@ -108,7 +122,7 @@ class RecordingPipeline(private val context: Context) {
     // held in portrait, despite this app's window being locked to sensorLandscape. Started
     // eagerly (not just while recording) so the first recording of a session already has a
     // fresh reading rather than needing to wait out OrientationEventListener's own warm-up.
-    private val orientationTracker = com.procamera.recorder.utils.DeviceOrientationTracker(context).apply { start() }
+    private val orientationTracker = com.aucampro.recorder.utils.DeviceOrientationTracker(context).apply { start() }
 
     /**
      * Guards every `sessionController.stop()` + `startRepeating()` pair (session
@@ -121,6 +135,94 @@ class RecordingPipeline(private val context: Context) {
      * function from inside another one's locked block (see the `*Locked` helpers below).
      */
     private val sessionMutex = Mutex()
+
+    /**
+     * Owns the coroutine that runs a mid-recording cleanup when an encoder's `onError`
+     * fires from its own (non-suspend) callback thread — [stopRecording] is `suspend` and
+     * needs [sessionMutex], so the callback can't just call it directly. `Main.immediate`
+     * (not `Default`) because [stopRecording]'s field mutations (`pipelineState`,
+     * `videoEncoder`, etc.) are plain `var`s relied on for single-thread (main) confinement
+     * elsewhere in this class — same dispatcher `viewModelScope.launch{}` uses when calling
+     * this normally, so this path doesn't introduce a new thread for those fields to race
+     * on. `SupervisorJob` so a failure in one launched cleanup doesn't cancel this scope for
+     * the next recording; cancelled in [stopAll].
+     */
+    private val pipelineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    /**
+     * **実機で発見**: an `AudioEncoder`/`VideoEncoder` error mid-recording used to only log
+     * and notify the UI (`Event.Failed`) — the *other* encoder, the camera session, and the
+     * muxer were never told to stop, so e.g. a mid-take `AudioEncoder` failure left
+     * `VideoEncoder` recording on alone for the rest of the take, producing a file whose
+     * video track ran far longer than its (silently truncated) audio track. Guards
+     * [onEncoderError] so only the *first* error of a take triggers the notify+cleanup
+     * sequence — if both encoders fail around the same time, the second is just logged.
+     * Reset at the top of each [startRecording] call.
+     */
+    private val recordingErrorHandled = AtomicBoolean(false)
+
+    /**
+     * Common handler for both encoders' `onError`: logs, best-effort persists the
+     * exception (message + full stack trace) to a small text file inside the take's own
+     * [currentOutputDir] — logcat alone was not a reliable diagnostic trail for this on a
+     * real device (its ring buffer had already rotated the original exception out by the
+     * time this bug was investigated) — then (once per take) notifies the caller and
+     * launches the *real* stop sequence on [pipelineScope] so the rest of the pipeline
+     * actually stops instead of silently recording video-only.
+     */
+    private fun onEncoderError(source: String, exception: Exception, onEvent: (Event) -> Unit) {
+        Log.e(TAG, "$source error", exception)
+        try {
+            currentOutputDir?.let { dir ->
+                File(dir, "encoder_error.txt").writeText(
+                    "time=${System.currentTimeMillis()} source=$source\n" +
+                        "${thermalSnapshotText()}\n" +
+                        "${exception.stackTraceToString()}\n",
+                )
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "onEncoderError: failed to write diagnostic file", e)
+        }
+        if (recordingErrorHandled.compareAndSet(false, true)) {
+            pipelineScope.launch {
+                stopRecording()
+                onEvent(Event.Failed("$source: ${exception.message}", sessionStopped = true))
+            }
+        }
+    }
+
+    /**
+     * One-shot thermal/battery-temperature snapshot for [onEncoderError]'s diagnostic file
+     * — user hypothesis (2026-07-16): the mid-recording audio failure might correlate with
+     * device heat rather than the GAIN/MAKEUP GAIN sliders themselves. `dumpsys
+     * thermalservice`'s status enum was already shown unreliable on this hardware in an
+     * earlier investigation (stayed NONE through a real, severe, measured frame-rate
+     * collapse — see docs/ARCHITECTURE.md's judgment log), so this also captures battery
+     * temperature (`BatteryManager`, always-available, numeric) as a corroborating signal
+     * independent of that enum. Read directly via [context] rather than adding a
+     * [com.aucampro.recorder.utils.ThermalMonitor] dependency here — that class is for
+     * ongoing UI-facing listening (owned by the ViewModel); this is a single point-in-time
+     * read at the moment of failure.
+     */
+    private fun thermalSnapshotText(): String {
+        val powerManager = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+        val thermalStatus = powerManager?.currentThermalStatus
+        val thermalStatusText = thermalStatus?.let {
+            com.aucampro.recorder.utils.ThermalMonitor.describeStatus(it)
+        } ?: "unavailable"
+        val headroom = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            powerManager?.getThermalHeadroom(10)?.takeUnless { it.isNaN() }
+        } else {
+            null
+        }
+        val batteryIntent = context.registerReceiver(
+            null,
+            android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED),
+        )
+        val tenthsOfCelsius = batteryIntent?.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, -1) ?: -1
+        val batteryTempText = if (tenthsOfCelsius >= 0) "${tenthsOfCelsius / 10.0}°C" else "unavailable"
+        return "thermalStatus=$thermalStatusText thermalHeadroom10s=${headroom ?: "n/a"} batteryTemp=$batteryTempText"
+    }
 
     /**
      * Exposed so the ViewModel can poll [NativeEngineBridge.peakDb]/[NativeEngineBridge.rmsDb]
@@ -296,9 +398,9 @@ class RecordingPipeline(private val context: Context) {
     private var requestFactory: ManualCaptureRequestFactory? = null
     private var currentParams = CameraParams()
     private var previewSurface: Surface? = null
-    private var histogramReader: com.procamera.recorder.camera.LuminanceHistogramReader? = null
+    private var histogramReader: com.aucampro.recorder.camera.LuminanceHistogramReader? = null
 
-    /** See [com.procamera.recorder.camera.LuminanceHistogramReader]'s doc — preview-only,
+    /** See [com.aucampro.recorder.camera.LuminanceHistogramReader]'s doc — preview-only,
      * frozen (not updated) while a recording is in progress. */
     var onHistogramUpdated: ((FloatArray) -> Unit)? = null
 
@@ -333,11 +435,11 @@ class RecordingPipeline(private val context: Context) {
     // left as a known gap rather than half-built, since PublicMovies is now the default.
     var onMediaCaptured: ((uri: android.net.Uri, isVideo: Boolean) -> Unit)? = null
 
-    // Tap/long-press-to-focus (§4.1) — see [com.procamera.recorder.camera.FocusController]'s
+    // Tap/long-press-to-focus (§4.1) — see [com.aucampro.recorder.camera.FocusController]'s
     // doc. (Re)created per [startPreview] since it's bound to that session's
     // CameraCharacteristics/ManualCaptureRequestFactory; torn down alongside the session in
     // [stopPreviewSession]/[stopAll].
-    private var focusController: com.procamera.recorder.camera.FocusController? = null
+    private var focusController: com.aucampro.recorder.camera.FocusController? = null
     var onTapToFocusLocked: ((focusDistanceDiopters: Float) -> Unit)? = null
 
     // §フォーカス位置表示 — see FocusController.onFocusIndicatorChanged's doc. Fires once
@@ -346,7 +448,7 @@ class RecordingPipeline(private val context: Context) {
     var onFocusIndicatorChanged: ((
         normalizedX: Float,
         normalizedY: Float,
-        state: com.procamera.recorder.camera.FocusController.FocusIndicatorState,
+        state: com.aucampro.recorder.camera.FocusController.FocusIndicatorState,
     ) -> Unit)? = null
 
     // ──────────────────────────────────────────────────────────────────────────────
@@ -449,10 +551,10 @@ class RecordingPipeline(private val context: Context) {
             currentParams = params
             previewSurface = surface
 
-            focusController = com.procamera.recorder.camera.FocusController(
+            focusController = com.aucampro.recorder.camera.FocusController(
                 characteristics = characteristics,
                 captureRequestFactory = requireNotNull(requestFactory),
-                requestSubmitter = com.procamera.recorder.camera.FocusController.RequestSubmitter { configure ->
+                requestSubmitter = com.aucampro.recorder.camera.FocusController.RequestSubmitter { configure ->
                     sessionController.submitSingleRequest(configure)
                 },
                 onFocusLocked = { distance ->
@@ -503,10 +605,10 @@ class RecordingPipeline(private val context: Context) {
             // never added to the recording session. A fresh reader is created per
             // startPreview() call (lens may have changed, and YUV sizes are per-camera).
             histogramReader?.close()
-            histogramReader = com.procamera.recorder.camera.LuminanceHistogramReader.smallestYuvSize(characteristics)
+            histogramReader = com.aucampro.recorder.camera.LuminanceHistogramReader.smallestYuvSize(characteristics)
                 ?.let { size ->
                     try {
-                        com.procamera.recorder.camera.LuminanceHistogramReader(size.width, size.height) { bins ->
+                        com.aucampro.recorder.camera.LuminanceHistogramReader(size.width, size.height) { bins ->
                             Handler(Looper.getMainLooper()).post { onHistogramUpdated?.invoke(bins) }
                         }
                     } catch (e: Exception) {
@@ -635,6 +737,8 @@ class RecordingPipeline(private val context: Context) {
         }
 
         try {
+            recordingErrorHandled.set(false)
+
             val pts = PtsClockDomain()
             ptsClockDomain = pts
             pts.start()
@@ -647,9 +751,10 @@ class RecordingPipeline(private val context: Context) {
                 capabilityInspector.isVideoConfigSupported(it.mimeType, it.width, it.height, it.frameRate, it.bitrate)
             } ?: caps.videoConfig
 
+            val takeTimestampMs = System.currentTimeMillis()
             val outputDir = File(
                 context.getExternalFilesDir(null),
-                "recordings/${System.currentTimeMillis()}",
+                "recordings/$takeTimestampMs",
             )
             outputDir.mkdirs()
             currentOutputDir = outputDir
@@ -661,7 +766,9 @@ class RecordingPipeline(private val context: Context) {
                 sessionController.characteristicsFor(caps.cameraId),
             )
             val muxer = SegmentedMuxerController(
-                outputPathForSegment = { index -> File(outputDir, "segment_$index.mp4").absolutePath },
+                outputPathForSegment = { index ->
+                    File(outputDir, "${APP_NAME_TAG}_${takeTimestampMs}_segment_$index.mp4").absolutePath
+                },
                 segmentDurationUs = segmentDurationMinutes * 60 * 1_000_000L,
                 orientationHintDegrees = orientationHint,
             )
@@ -681,10 +788,8 @@ class RecordingPipeline(private val context: Context) {
                     override fun onEncodedFrame(buffer: ByteBuffer, bufferInfo: MediaCodec.BufferInfo) =
                         muxer.onVideoSample(buffer, bufferInfo)
 
-                    override fun onError(exception: Exception) {
-                        Log.e(TAG, "VideoEncoder error", exception)
-                        onEvent(Event.Failed("VideoEncoder: ${exception.message}"))
-                    }
+                    override fun onError(exception: Exception) =
+                        onEncoderError("VideoEncoder", exception, onEvent)
                 },
             )
             videoEncoder = video
@@ -705,10 +810,8 @@ class RecordingPipeline(private val context: Context) {
                     override fun onEncodedFrame(buffer: ByteBuffer, bufferInfo: MediaCodec.BufferInfo) =
                         muxer.onAudioSample(buffer, bufferInfo)
 
-                    override fun onError(exception: Exception) {
-                        Log.e(TAG, "AudioEncoder error", exception)
-                        onEvent(Event.Failed("AudioEncoder: ${exception.message}"))
-                    }
+                    override fun onError(exception: Exception) =
+                        onEncoderError("AudioEncoder", exception, onEvent)
                 },
             )
             audioEncoder = audio
@@ -739,8 +842,8 @@ class RecordingPipeline(private val context: Context) {
             onEvent(Event.Started(outputDir))
         } catch (e: Exception) {
             Log.e(TAG, "startRecording failed", e)
-            onEvent(Event.Failed(e.message ?: e.toString()))
             sessionMutex.withLock { stopRecordingInternalLocked(restartPreview = false) }
+            onEvent(Event.Failed(e.message ?: e.toString(), sessionStopped = true))
         }
     }
 
@@ -827,6 +930,7 @@ class RecordingPipeline(private val context: Context) {
         focusController = null
         audioEngineActive = false
         pipelineState = PipelineState.IDLE
+        pipelineScope.cancel()
     }
 
     /**
@@ -906,7 +1010,7 @@ class RecordingPipeline(private val context: Context) {
      * Best-effort crash-safety net (§4.6): closes whatever [MediaMuxer] is currently open
      * (via [SegmentedMuxerController.stop]) so it gets a valid moov box, without trying to
      * cleanly signal EOS or drain the encoders first. Meant to be called from a
-     * [Thread.UncaughtExceptionHandler] — see [com.procamera.recorder.ProCameraApplication]
+     * [Thread.UncaughtExceptionHandler] — see [com.aucampro.recorder.AuCamPROApplication]
      * — where the process is about to die and there is no time (or dispatcher guarantee)
      * for the normal suspend stop sequence.
      *
@@ -1039,7 +1143,7 @@ class RecordingPipeline(private val context: Context) {
 
     /**
      * If [storageLocation] is [StorageLocation.PublicMovies], copies each finalised segment
-     * `.mp4` out of the app-private [outputDir] into the shared `Movies/ProCamera` collection
+     * `.mp4` out of the app-private [outputDir] into the shared `Movies/AuCamPRO` collection
      * via MediaStore (so it shows up in the gallery), then deletes the app-private copy.
      * No-op for [StorageLocation.AppPrivate]. Runs synchronously (blocking file I/O) — always
      * called after encoders/muxer are already fully stopped and drained, so callers are
@@ -1060,7 +1164,7 @@ class RecordingPipeline(private val context: Context) {
                 val values = ContentValues().apply {
                     put(MediaStore.Video.Media.DISPLAY_NAME, file.name)
                     put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                    put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/ProCamera")
+                    put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/AuCamPRO")
                     put(MediaStore.Video.Media.IS_PENDING, 1)
                 }
                 val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
@@ -1073,7 +1177,7 @@ class RecordingPipeline(private val context: Context) {
                 }
                 resolver.update(uri, ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }, null, null)
                 file.delete()
-                Log.i(TAG, "Exported ${file.name} to Movies/ProCamera")
+                Log.i(TAG, "Exported ${file.name} to Movies/AuCamPRO")
                 lastExportedUri = uri
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to export ${file.name} to MediaStore Movies", e)
@@ -1093,7 +1197,7 @@ class RecordingPipeline(private val context: Context) {
 
     /**
      * Fires a still-photo capture via [photoReader] (set up in [startPreview] alongside the
-     * histogram reader) and saves the resulting JPEG to MediaStore `Pictures/ProCamera`
+     * histogram reader) and saves the resulting JPEG to MediaStore `Pictures/AuCamPRO`
      * (always the public gallery location — unlike video's [StorageLocation] choice, a
      * one-off photo the user explicitly asked to capture is exactly the kind of content a
      * gallery app should show). No-op if not currently in a session with a live photo
@@ -1137,7 +1241,7 @@ class RecordingPipeline(private val context: Context) {
      * Long-press-to-focus on the preview (§4.1) — [normalizedX]/[normalizedY] are [0,1]
      * preview-view coordinates (top-left origin), already corrected by the caller for any
      * letterboxing between the on-screen view and the actual preview `Surface` bounds (see
-     * [com.procamera.recorder.camera.TapToMeteringRegion]'s doc for the full contract).
+     * [com.aucampro.recorder.camera.TapToMeteringRegion]'s doc for the full contract).
      * No-op if no preview session is active yet ([focusController] is null before the
      * first successful [startPreview]).
      */
@@ -1147,11 +1251,11 @@ class RecordingPipeline(private val context: Context) {
 
     private fun savePhotoToMediaStore(bytes: ByteArray) {
         val resolver = context.contentResolver
-        val fileName = "IMG_${System.currentTimeMillis()}.jpg"
+        val fileName = "${APP_NAME_TAG}_IMG_${System.currentTimeMillis()}.jpg"
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
             put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/ProCamera")
+            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/AuCamPRO")
             put(MediaStore.Images.Media.IS_PENDING, 1)
         }
         val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
@@ -1231,6 +1335,11 @@ class RecordingPipeline(private val context: Context) {
 
     private companion object {
         const val TAG = "RecordingPipeline"
+
+        // Prefixes exported media filenames (segments, photos) with the app's brand name plus
+        // a timestamp — both for gallery branding and to avoid MediaStore DISPLAY_NAME
+        // collisions across separate recordings/captures.
+        const val APP_NAME_TAG = "AuCamPRO"
 
         // Must match app/src/main/cpp/engine/OboeFullDuplexEngine.h's kSampleRate/kChannelCount.
         const val AUDIO_SAMPLE_RATE_HZ = 48_000

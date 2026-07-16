@@ -1,4 +1,4 @@
-package com.procamera.recorder.audio
+package com.aucampro.recorder.audio
 
 /**
  * Kotlin-facing wrapper around the native `OboeFullDuplexEngine` (see
@@ -67,7 +67,7 @@ class NativeEngineBridge : AutoCloseable {
 
     /**
      * One-shot (framePosition, timeNanos) correlation at CLOCK_MONOTONIC, used to seed
-     * [com.procamera.recorder.muxer.PtsClockDomain]'s audio anchor with the audio
+     * [com.aucampro.recorder.muxer.PtsClockDomain]'s audio anchor with the audio
      * pipeline's true capture-time basis rather than a callback's wall-clock arrival time
      * (see the native-side doc comment for why that distinction matters for §4.3's A/V
      * sync budget). Returns null if not yet available (e.g. queried too soon after
@@ -84,7 +84,7 @@ class NativeEngineBridge : AutoCloseable {
     fun drainEncoderBuffer(dst: FloatArray, maxFrames: Int): Int = nativeDrainEncoderBuffer(handle, dst, maxFrames)
 
     /** Discards any stale backlog (see `OboeFullDuplexEngine::flushRingBuffer`'s doc) —
-     * call before a fresh [com.procamera.recorder.encoder.AudioEncoder] starts draining. */
+     * call before a fresh [com.aucampro.recorder.encoder.AudioEncoder] starts draining. */
     fun flushRingBuffer() = nativeFlushRingBuffer(handle)
 
     override fun close() {
@@ -100,7 +100,7 @@ class NativeEngineBridge : AutoCloseable {
         const val SILENCE_DB = -100f // matches PeakRmsMeter.cpp's own kSilenceFloorDb
 
         init {
-            System.loadLibrary("procamera_native")
+            System.loadLibrary("aucampro_native")
         }
     }
 

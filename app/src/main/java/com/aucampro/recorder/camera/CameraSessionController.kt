@@ -1,4 +1,4 @@
-package com.procamera.recorder.camera
+package com.aucampro.recorder.camera
 
 import android.Manifest
 import android.hardware.camera2.CameraCaptureSession
@@ -351,10 +351,15 @@ class CameraSessionController(private val cameraManager: CameraManager) {
             callbackExecutor,
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(session: CameraCaptureSession) {
-                    cont.resume(session)
+                    if (cont.isActive) {
+                        cont.resume(session)
+                    } else {
+                        session.close()
+                    }
                 }
 
                 override fun onConfigureFailed(session: CameraCaptureSession) {
+                    session.close()
                     if (cont.isActive) {
                         cont.resumeWithException(
                             IllegalStateException("Camera session configuration failed"),

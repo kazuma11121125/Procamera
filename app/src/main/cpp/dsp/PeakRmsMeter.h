@@ -4,7 +4,7 @@
 #include <atomic>
 #include <cstddef>
 
-namespace procamera {
+namespace aucampro {
 
 // Peak/RMS meter in dBFS, tracked independently per channel (L/R) rather than collapsed
 // into a single combined value — a stereo mic signal can be much louder on one side (an
@@ -51,4 +51,4 @@ private:
     std::array<std::atomic<float>, kMaxChannels> rmsDb_{-100.0f, -100.0f};
 };
 
-}  // namespace procamera
+}  // namespace aucampro

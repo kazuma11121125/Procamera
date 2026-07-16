@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(procamera_native_tests LANGUAGES CXX)
+project(aucampro_native_tests LANGUAGES CXX)
 
 # Standalone HOST-build CMake project (deliberately separate from
 # app/src/main/cpp/CMakeLists.txt, which cross-compiles for Android via the NDK). This
@@ -27,7 +27,7 @@ endif()
 # ASan+UBSan+TSan-friendly debug build by default on host: this is exactly where we can
 # catch the ring buffer's memory-ordering bugs that would otherwise only surface as rare,
 # unreproducible glitches on a real device.
-option(PROCAMERA_TEST_SANITIZERS "Enable ASan+UBSan for the host test build" ON)
+option(AUCAMPRO_TEST_SANITIZERS "Enable ASan+UBSan for the host test build" ON)
 
 include(FetchContent)
 FetchContent_Declare(
@@ -38,28 +38,28 @@ set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
-set(PROCAMERA_CPP_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
+set(AUCAMPRO_CPP_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
-add_library(procamera_portable STATIC
-    ${PROCAMERA_CPP_ROOT}/dsp/BiquadEq.cpp
-    ${PROCAMERA_CPP_ROOT}/dsp/SafetyLimiter.cpp
-    ${PROCAMERA_CPP_ROOT}/dsp/PeakRmsMeter.cpp
-    ${PROCAMERA_CPP_ROOT}/dsp/InputGain.cpp
-    ${PROCAMERA_CPP_ROOT}/dsp/MakeupGain.cpp
-    ${PROCAMERA_CPP_ROOT}/dsp/HighPassFilter.cpp
+add_library(aucampro_portable STATIC
+    ${AUCAMPRO_CPP_ROOT}/dsp/BiquadEq.cpp
+    ${AUCAMPRO_CPP_ROOT}/dsp/SafetyLimiter.cpp
+    ${AUCAMPRO_CPP_ROOT}/dsp/PeakRmsMeter.cpp
+    ${AUCAMPRO_CPP_ROOT}/dsp/InputGain.cpp
+    ${AUCAMPRO_CPP_ROOT}/dsp/MakeupGain.cpp
+    ${AUCAMPRO_CPP_ROOT}/dsp/HighPassFilter.cpp
 )
-target_include_directories(procamera_portable PUBLIC ${PROCAMERA_CPP_ROOT})
-target_compile_options(procamera_portable PUBLIC -Wall -Wextra)
+target_include_directories(aucampro_portable PUBLIC ${AUCAMPRO_CPP_ROOT})
+target_compile_options(aucampro_portable PUBLIC -Wall -Wextra)
 
-if(PROCAMERA_TEST_SANITIZERS)
+if(AUCAMPRO_TEST_SANITIZERS)
     set(TEST_SANITIZER_FLAGS -fsanitize=address,undefined -fno-omit-frame-pointer)
-    target_compile_options(procamera_portable PUBLIC ${TEST_SANITIZER_FLAGS})
-    target_link_options(procamera_portable PUBLIC ${TEST_SANITIZER_FLAGS})
+    target_compile_options(aucampro_portable PUBLIC ${TEST_SANITIZER_FLAGS})
+    target_link_options(aucampro_portable PUBLIC ${TEST_SANITIZER_FLAGS})
 endif()
 
 enable_testing()
 
-add_executable(procamera_native_tests
+add_executable(aucampro_native_tests
     test_result.cpp
     test_ring_buffer.cpp
     test_triple_buffer.cpp
@@ -68,7 +68,7 @@ add_executable(procamera_native_tests
     test_peak_rms_meter.cpp
     test_input_gain.cpp
 )
-target_link_libraries(procamera_native_tests PRIVATE procamera_portable GTest::gtest_main)
+target_link_libraries(aucampro_native_tests PRIVATE aucampro_portable GTest::gtest_main)
 
 include(GoogleTest)
-gtest_discover_tests(procamera_native_tests)
+gtest_discover_tests(aucampro_native_tests)

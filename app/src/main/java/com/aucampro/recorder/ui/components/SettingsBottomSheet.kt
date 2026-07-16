@@ -1,4 +1,4 @@
-package com.procamera.recorder.ui.components
+package com.aucampro.recorder.ui.components
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
@@ -20,15 +20,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.procamera.recorder.camera.CameraCapabilityInspector
-import com.procamera.recorder.ui.theme.Amber
-import com.procamera.recorder.ui.theme.OnSurfacePrimary
-import com.procamera.recorder.ui.theme.OnSurfaceSecondary
-import com.procamera.recorder.ui.theme.SurfaceDark
-import com.procamera.recorder.ui.viewmodel.CameraControlViewModel
-import com.procamera.recorder.ui.viewmodel.CameraUiState
-import com.procamera.recorder.ui.viewmodel.FrameLineAspectRatio
-import com.procamera.recorder.ui.viewmodel.StorageLocation
+import com.aucampro.recorder.camera.CameraCapabilityInspector
+import com.aucampro.recorder.ui.theme.Amber
+import com.aucampro.recorder.ui.theme.OnSurfacePrimary
+import com.aucampro.recorder.ui.theme.OnSurfaceSecondary
+import com.aucampro.recorder.ui.theme.SurfaceDark
+import com.aucampro.recorder.ui.viewmodel.CameraControlViewModel
+import com.aucampro.recorder.ui.viewmodel.CameraUiState
+import com.aucampro.recorder.ui.viewmodel.FrameLineAspectRatio
+import com.aucampro.recorder.ui.viewmodel.StorageLocation
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -179,7 +179,7 @@ fun SettingsBottomSheet(
                 fontSize = 12.sp,
                 modifier = Modifier.padding(bottom = 8.dp)
             )
-            com.procamera.recorder.audio.AudioDeviceRouter.InputKind.entries.forEach { kind ->
+            com.aucampro.recorder.audio.AudioDeviceRouter.InputKind.entries.forEach { kind ->
                 val isSelected = state.settings.audioInputPreference == kind
                 Row(
                     verticalAlignment = Alignment.CenterVertically,

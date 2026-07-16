@@ -2,7 +2,7 @@
 
 #include <cstddef>
 
-namespace procamera {
+namespace aucampro {
 
 // Look-ahead-less soft-knee clipper applied after the 3-band EQ (§4.2 "セイフティリミッ
 // ター"). The EQ's own gain stages (e.g. Mid +3dB) can create digital-domain clipping that
@@ -28,4 +28,4 @@ private:
     float thresholdLinear_;
 };
 
-}  // namespace procamera
+}  // namespace aucampro

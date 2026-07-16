@@ -1,4 +1,4 @@
-package com.procamera.recorder.muxer
+package com.aucampro.recorder.muxer
 
 import com.google.common.truth.Truth.assertThat
 import org.junit.Test

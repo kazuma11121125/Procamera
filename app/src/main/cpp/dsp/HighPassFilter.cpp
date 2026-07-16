@@ -1,6 +1,6 @@
 #include "dsp/HighPassFilter.h"
 
-namespace procamera {
+namespace aucampro {
 
 HighPassFilter::HighPassFilter(double sampleRateHz, int channelCount)
     : sampleRateHz_(sampleRateHz), channelCount_(channelCount), historyPerChannel_(channelCount) {
@@ -90,4 +90,4 @@ void HighPassFilter::process(float *interleaved, size_t frameCount) {
     }
 }
 
-}  // namespace procamera
+}  // namespace aucampro

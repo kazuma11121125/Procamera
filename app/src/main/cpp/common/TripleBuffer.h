@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace procamera {
+namespace aucampro {
 
 // Wait-free single-writer/single-reader triple buffer for exchanging small POD state
 // (e.g. EQ coefficients) between the UI/coroutine thread (writer) and the audio callback
@@ -68,4 +68,4 @@ private:
     uint8_t readIndex_ = 2;   // reader-owned, never accessed by writer
 };
 
-}  // namespace procamera
+}  // namespace aucampro

@@ -1,4 +1,4 @@
-package com.procamera.recorder.audio
+package com.aucampro.recorder.audio
 
 import android.content.Context
 import android.media.AudioDeviceCallback
@@ -14,7 +14,7 @@ import android.os.HandlerThread
  * callback thread.
  *
  * This class only *selects and observes* devices; it does not open/close streams. The
- * caller ([com.procamera.recorder.pipeline.RecordingPipeline]) owns that, and must be the
+ * caller ([com.aucampro.recorder.pipeline.RecordingPipeline]) owns that, and must be the
  * one to fall back through [candidateInputDevices] in order — the native layer
  * (`OboeFullDuplexEngine::openInputStreamLocked`) only retries SharingMode/InputPreset
  * combinations on a *single* deviceId, it never tries a different device. Without that
@@ -46,7 +46,7 @@ class AudioDeviceRouter(context: Context) {
      *
      * Note this is a *reordering* of the same device list, never a filter: even when the
      * user manually pins e.g. [InputKind.Usb], the built-in mic stays in the list (just
-     * pushed to the back) so [com.procamera.recorder.pipeline.RecordingPipeline]'s
+     * pushed to the back) so [com.aucampro.recorder.pipeline.RecordingPipeline]'s
      * fallback-through-candidates loop still has something to land on if no USB device is
      * actually connected right now, rather than silently recording nothing.
      */
@@ -64,7 +64,7 @@ class AudioDeviceRouter(context: Context) {
      * monitoring (§4.5 "モニタリング再生"): enabling monitoring through the built-in
      * speaker while simultaneously recording from the mic would let the mic pick the
      * speaker output back up, causing a feedback howl. See
-     * [com.procamera.recorder.pipeline.RecordingPipeline.setMonitoringEnabled]'s doc for
+     * [com.aucampro.recorder.pipeline.RecordingPipeline.setMonitoringEnabled]'s doc for
      * how this is enforced both at toggle-time and on hot-swap.
      *
      * Deliberately an *allowlist*, not "anything but the speaker": [AudioManager] can

@@ -1,13 +1,13 @@
-package com.procamera.recorder.utils
+package com.aucampro.recorder.utils
 
 import android.content.Context
 import android.content.SharedPreferences
 import android.net.Uri
-import com.procamera.recorder.audio.AudioDeviceRouter
-import com.procamera.recorder.ui.viewmodel.CameraUiState
-import com.procamera.recorder.ui.viewmodel.EqBandState
-import com.procamera.recorder.ui.viewmodel.FrameLineAspectRatio
-import com.procamera.recorder.ui.viewmodel.StorageLocation
+import com.aucampro.recorder.audio.AudioDeviceRouter
+import com.aucampro.recorder.ui.viewmodel.CameraUiState
+import com.aucampro.recorder.ui.viewmodel.EqBandState
+import com.aucampro.recorder.ui.viewmodel.FrameLineAspectRatio
+import com.aucampro.recorder.ui.viewmodel.StorageLocation
 
 /**
  * Plain `SharedPreferences` (not DataStore — nothing else in this project pulls in that
@@ -84,6 +84,12 @@ class UserPreferencesStore(context: Context) {
 
     private fun loadStorageLocation(): StorageLocation {
         return when (prefs.getString(KEY_STORAGE_LOCATION_KIND, null)) {
+            // No key written yet (fresh install / first run): match CameraUiState's declared
+            // default (PublicMovies) instead of silently falling back to AppPrivate — a first
+            // launch was otherwise recording into app-private storage invisible to the
+            // gallery, contradicting the UI model's own stated default.
+            null -> StorageLocation.PublicMovies
+            "AppPrivate" -> StorageLocation.AppPrivate
             "PublicMovies" -> StorageLocation.PublicMovies
             "Custom" -> {
                 val uriString = prefs.getString(KEY_STORAGE_LOCATION_URI, null)
@@ -149,7 +155,7 @@ class UserPreferencesStore(context: Context) {
     }
 
     private companion object {
-        const val PREFS_NAME = "procamera_user_prefs"
+        const val PREFS_NAME = "aucampro_user_prefs"
         const val EQ_BAND_COUNT = 3
 
         const val KEY_LENS_CAMERA_ID = "lens_camera_id"

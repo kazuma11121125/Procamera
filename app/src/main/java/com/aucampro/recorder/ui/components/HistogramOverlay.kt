@@ -1,4 +1,4 @@
-package com.procamera.recorder.ui.components
+package com.aucampro.recorder.ui.components
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -12,15 +12,15 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.unit.dp
-import com.procamera.recorder.ui.theme.Amber
-import com.procamera.recorder.ui.theme.SurfaceBlack
-import com.procamera.recorder.ui.theme.SurfaceVariant
+import com.aucampro.recorder.ui.theme.Amber
+import com.aucampro.recorder.ui.theme.SurfaceBlack
+import com.aucampro.recorder.ui.theme.SurfaceVariant
 
 /**
  * Luminance histogram (Sony__________.pdf's "ヒストグラム(輝度分布グラフ)" UI assist) —
  * a plain bar-graph readout of [bins] (normalized [0,1] per bucket, dark-to-bright left to
  * right), matching Sony's own framing of this as a luminance distribution rather than
- * per-channel RGB. See [com.procamera.recorder.camera.LuminanceHistogramReader] for how the
+ * per-channel RGB. See [com.aucampro.recorder.camera.LuminanceHistogramReader] for how the
  * data is sampled; this composable is purely a renderer.
  *
  * `null` while no sample has arrived yet (before the first preview frame, or once a

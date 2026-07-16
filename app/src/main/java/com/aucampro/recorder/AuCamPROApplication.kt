@@ -1,8 +1,8 @@
-package com.procamera.recorder
+package com.aucampro.recorder
 
 import android.app.Application
 import android.util.Log
-import com.procamera.recorder.pipeline.RecordingPipeline
+import com.aucampro.recorder.pipeline.RecordingPipeline
 
 /**
  * Composition root. Dependency wiring uses manual DI via [AppContainer] rather than
@@ -17,13 +17,13 @@ import com.procamera.recorder.pipeline.RecordingPipeline
  * happens and is still reported normally, this only tries to save the in-progress
  * segment first.
  */
-class ProCameraApplication : Application() {
+class AuCamPROApplication : Application() {
 
     lateinit var container: AppContainer
         private set
 
     /**
-     * Set by [com.procamera.recorder.ui.viewmodel.CameraControlViewModel] to the single
+     * Set by [com.aucampro.recorder.ui.viewmodel.CameraControlViewModel] to the single
      * [RecordingPipeline] instance it owns, so the crash handler below can reach it
      * without a DI graph. `emergencyFinalizeCurrentSegment()` is already a no-op when
      * nothing is being recorded, so this is left set for the ViewModel's whole lifetime
@@ -52,6 +52,6 @@ class ProCameraApplication : Application() {
     }
 
     private companion object {
-        const val TAG = "ProCameraApplication"
+        const val TAG = "AuCamPROApplication"
     }
 }

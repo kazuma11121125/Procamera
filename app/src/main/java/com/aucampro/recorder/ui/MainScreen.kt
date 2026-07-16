@@ -1,4 +1,4 @@
-package com.procamera.recorder.ui
+package com.aucampro.recorder.ui
 
 import android.Manifest
 import android.content.Intent
@@ -77,34 +77,34 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.procamera.recorder.ui.components.FocusReticleOverlay
-import com.procamera.recorder.ui.components.FrameLineOverlay
-import com.procamera.recorder.ui.components.HistogramOverlay
-import com.procamera.recorder.ui.components.LevelGaugeOverlay
-import com.procamera.recorder.ui.components.StereoAudioMeter
-import com.procamera.recorder.ui.components.FocusSlider
-import com.procamera.recorder.ui.components.IsoSlider
-import com.procamera.recorder.ui.components.ManualControlSlider
-import com.procamera.recorder.ui.components.PreviewSurfaceView
-import com.procamera.recorder.ui.components.ShutterSlider
-import com.procamera.recorder.ui.components.WhiteBalanceSlider
-import com.procamera.recorder.ui.theme.Amber
-import com.procamera.recorder.ui.theme.OnSurfacePrimary
-import com.procamera.recorder.ui.theme.OnSurfaceSecondary
-import com.procamera.recorder.ui.theme.RecRed
-import com.procamera.recorder.ui.theme.SurfaceBlack
-import com.procamera.recorder.ui.theme.SurfaceDark
-import com.procamera.recorder.ui.viewmodel.CameraControlViewModel
-import com.procamera.recorder.ui.viewmodel.CameraUiState
-import com.procamera.recorder.ui.viewmodel.CaptureMode
-import com.procamera.recorder.ui.viewmodel.ControlPanel
-import com.procamera.recorder.ui.viewmodel.EqBandState
-import com.procamera.recorder.ui.viewmodel.RecordingUiState
-import com.procamera.recorder.ui.components.SettingsBottomSheet
+import com.aucampro.recorder.ui.components.FocusReticleOverlay
+import com.aucampro.recorder.ui.components.FrameLineOverlay
+import com.aucampro.recorder.ui.components.HistogramOverlay
+import com.aucampro.recorder.ui.components.LevelGaugeOverlay
+import com.aucampro.recorder.ui.components.StereoAudioMeter
+import com.aucampro.recorder.ui.components.FocusSlider
+import com.aucampro.recorder.ui.components.IsoSlider
+import com.aucampro.recorder.ui.components.ManualControlSlider
+import com.aucampro.recorder.ui.components.PreviewSurfaceView
+import com.aucampro.recorder.ui.components.ShutterSlider
+import com.aucampro.recorder.ui.components.WhiteBalanceSlider
+import com.aucampro.recorder.ui.theme.Amber
+import com.aucampro.recorder.ui.theme.OnSurfacePrimary
+import com.aucampro.recorder.ui.theme.OnSurfaceSecondary
+import com.aucampro.recorder.ui.theme.RecRed
+import com.aucampro.recorder.ui.theme.SurfaceBlack
+import com.aucampro.recorder.ui.theme.SurfaceDark
+import com.aucampro.recorder.ui.viewmodel.CameraControlViewModel
+import com.aucampro.recorder.ui.viewmodel.CameraUiState
+import com.aucampro.recorder.ui.viewmodel.CaptureMode
+import com.aucampro.recorder.ui.viewmodel.ControlPanel
+import com.aucampro.recorder.ui.viewmodel.EqBandState
+import com.aucampro.recorder.ui.viewmodel.RecordingUiState
+import com.aucampro.recorder.ui.components.SettingsBottomSheet
 import kotlin.math.roundToInt
 
 /**
- * Root composable for the ProCamera recording screen (§4.5).
+ * Root composable for the AuCamPRO recording screen (§4.5).
  *
  * Layout (portrait):
  * ```
@@ -835,7 +835,7 @@ private fun LazyListScope.cameraControlsPanelItems(
     // after MainActivity's PermissionGate has already verified CAMERA is granted; lint
     // can't see across that composable boundary, so it's suppressed at this call site.
     @Suppress("MissingPermission")
-    fun onLensSelected(lens: com.procamera.recorder.camera.CameraCapabilityInspector.AvailableLens) {
+    fun onLensSelected(lens: com.aucampro.recorder.camera.CameraCapabilityInspector.AvailableLens) {
         viewModel.switchLens(lens)
     }
 
@@ -1071,9 +1071,9 @@ private fun WbPresetRow(
 @Composable
 private fun ShutterPresetRow(
     currentExposureNanos: Long,
-    onPresetSelect: (com.procamera.recorder.camera.CaptureRangeClamper.ShutterPreset) -> Unit,
+    onPresetSelect: (com.aucampro.recorder.camera.CaptureRangeClamper.ShutterPreset) -> Unit,
 ) {
-    val presets = com.procamera.recorder.camera.CaptureRangeClamper.ShutterPreset.entries
+    val presets = com.aucampro.recorder.camera.CaptureRangeClamper.ShutterPreset.entries
     Row(
         modifier = Modifier
             .fillMaxWidth()

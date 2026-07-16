@@ -1,12 +1,12 @@
-package com.procamera.recorder.ui.viewmodel
+package com.aucampro.recorder.ui.viewmodel
 
 import androidx.compose.runtime.Immutable
 import android.net.Uri
-import com.procamera.recorder.audio.AudioDeviceRouter
-import com.procamera.recorder.camera.CameraCapabilityInspector
-import com.procamera.recorder.camera.CaptureRangeClamper
-import com.procamera.recorder.camera.FocusController
-import com.procamera.recorder.pipeline.RecordingPipeline
+import com.aucampro.recorder.audio.AudioDeviceRouter
+import com.aucampro.recorder.camera.CameraCapabilityInspector
+import com.aucampro.recorder.camera.CaptureRangeClamper
+import com.aucampro.recorder.camera.FocusController
+import com.aucampro.recorder.pipeline.RecordingPipeline
 import java.io.File
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -82,7 +82,7 @@ data class EqBandState(
  * explain it — a symptom of main-thread contention, not thermal throttling). Isolating
  * this into its own flow means only the few small composables that actually read it
  * (the on-preview meter widget, the AUDIO tab's stats row) recompose on each tick; see
- * [com.procamera.recorder.ui.MainScreen]'s `AudioMeterHost`/`AudioStatsRow` for how they
+ * [com.aucampro.recorder.ui.MainScreen]'s `AudioMeterHost`/`AudioStatsRow` for how they
  * collect this flow locally rather than receiving it as a parameter from further up the
  * tree, which would just reintroduce the same problem one level higher.
  */
@@ -150,7 +150,7 @@ sealed interface StorageLocation {
  * aspect ratio is unaffected; only the on-screen preview gets the guide overlay. A true
  * encode-time crop to an arbitrary ratio (progress_summary.md's original "自由なアスペクト
  * 比のクロップ設定" request) would require inserting a GL rendering stage between Camera2
- * and the encoder's InputSurface — see [com.procamera.recorder.encoder.VideoEncoder]'s doc
+ * and the encoder's InputSurface — see [com.aucampro.recorder.encoder.VideoEncoder]'s doc
  * for why the current direct camera→encoder path's PTS behavior was hard-won on real
  * hardware, and why that GL insertion was deferred rather than attempted blind.
  */
@@ -189,7 +189,7 @@ data class SettingsState(
 // ──────────────────────────────────────────────────────────────────────────────
 
 /**
- * Complete UI state for [com.procamera.recorder.ui.MainScreen].
+ * Complete UI state for [com.aucampro.recorder.ui.MainScreen].
  *
  * **実機で発見**: this class carries several fields the Compose compiler cannot prove
  * stable on its own — `List<...>` ([availableLenses], [availableVideoConfigs],
@@ -198,10 +198,10 @@ data class SettingsState(
  * Android/JDK types with no stability annotation of their own). Without an explicit
  * promise, the compiler treats the *whole* data class as unstable — which means every
  * composable taking `state: CameraUiState` as a parameter (nearly everything under
- * [com.procamera.recorder.ui.MainScreen]) loses Compose's "skip recomposition if
+ * [com.aucampro.recorder.ui.MainScreen]) loses Compose's "skip recomposition if
  * parameters are unchanged" optimization entirely, for every field, all the time. Since
  * every mutation here already goes through `_uiState.update { it.copy(...) }` (never an
- * in-place field mutation — see [com.procamera.recorder.ui.viewmodel.CameraControlViewModel]),
+ * in-place field mutation — see [com.aucampro.recorder.ui.viewmodel.CameraControlViewModel]),
  * this class genuinely *is* immutable in practice, so `@Immutable` is a safe, accurate
  * promise, not just a suppression. Measured on-device: this alone was the largest single
  * factor in a ~3-5x higher idle main-thread CPU cost versus a comparable native
@@ -274,7 +274,7 @@ data class CameraUiState(
     val monitoringEnabled: Boolean = false,
 
     /** Human-readable label (§4.5 "現在の入力デバイス表示") for whichever input device
-     * [com.procamera.recorder.audio.AudioDeviceRouter] actually landed on — "USB Audio" /
+     * [com.aucampro.recorder.audio.AudioDeviceRouter] actually landed on — "USB Audio" /
      * "有線ヘッドセット" / "内蔵マイク" / "既定" before the audio engine has started once. */
     val audioInputDeviceLabel: String = "既定",
 

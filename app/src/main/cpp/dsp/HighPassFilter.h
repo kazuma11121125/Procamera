@@ -6,7 +6,7 @@
 #include "common/TripleBuffer.h"
 #include "dsp/BiquadEq.h"
 
-namespace procamera {
+namespace aucampro {
 
 // Single-band, on/off-able high-pass filter (§4.2 "風切り音/ハンドリングノイズ対策の
 // ローカット") — first in the DSP chain, before ThreeBandEq (see
@@ -68,4 +68,4 @@ private:
     std::vector<FilterHistory> historyPerChannel_;
 };
 
-}  // namespace procamera
+}  // namespace aucampro

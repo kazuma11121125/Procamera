@@ -1,4 +1,4 @@
-package com.procamera.recorder.encoder
+package com.aucampro.recorder.encoder
 
 import kotlin.random.Random
 

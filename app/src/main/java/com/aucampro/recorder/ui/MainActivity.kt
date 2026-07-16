@@ -1,4 +1,4 @@
-package com.procamera.recorder.ui
+package com.aucampro.recorder.ui
 
 import android.Manifest
 import android.content.pm.PackageManager
@@ -31,14 +31,14 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import com.procamera.recorder.ui.theme.Amber
-import com.procamera.recorder.ui.theme.OnSurfaceSecondary
-import com.procamera.recorder.ui.theme.ProCameraTheme
-import com.procamera.recorder.ui.theme.SurfaceBlack
-import com.procamera.recorder.ui.viewmodel.CameraControlViewModel
+import com.aucampro.recorder.ui.theme.Amber
+import com.aucampro.recorder.ui.theme.OnSurfaceSecondary
+import com.aucampro.recorder.ui.theme.AuCamPROTheme
+import com.aucampro.recorder.ui.theme.SurfaceBlack
+import com.aucampro.recorder.ui.viewmodel.CameraControlViewModel
 
 /**
- * Host Activity for ProCamera.
+ * Host Activity for AuCamPRO.
  *
  * Responsibilities (by intent, matching §4.5/§4.6 design):
  * - Requests CAMERA, RECORD_AUDIO, POST_NOTIFICATIONS permissions before composing [MainScreen].
@@ -86,7 +86,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         setContent {
-            ProCameraTheme {
+            AuCamPROTheme {
                 PermissionGate {
                     MainScreen()
                 }
@@ -98,7 +98,7 @@ class MainActivity : ComponentActivity() {
      * Xperia's dedicated hardware camera/shutter key (Sony__________.pdf: "カメラキー(シャッ
      * ターボタン)の割り当てAssign shutter button") dispatches through
      * [CameraControlViewModel.onShutterPressed], so it takes a photo or toggles REC
-     * depending on the current [com.procamera.recorder.ui.viewmodel.CaptureMode]
+     * depending on the current [com.aucampro.recorder.ui.viewmodel.CaptureMode]
      * (§写真/動画モード切り替え, Photo Pro/Video Pro方式) rather than always meaning REC.
      * Handled at `dispatchKeyEvent`
      * rather than `onKeyDown` so it's intercepted ahead of Compose's own focus-based key
@@ -210,7 +210,7 @@ private fun PermissionGate(content: @Composable () -> Unit) {
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(
-                    text = "ProCamera",
+                    text = "AuCamPRO",
                     style = MaterialTheme.typography.headlineLarge,
                     color = Amber,
                 )

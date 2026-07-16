@@ -1,4 +1,4 @@
-package com.procamera.recorder.muxer
+package com.aucampro.recorder.muxer
 
 import android.media.MediaCodec
 import android.media.MediaFormat
@@ -16,7 +16,11 @@ import java.nio.ByteBuffer
  * `MediaMuxer.writeSampleData` is not documented as thread-safe for concurrent callers,
  * and video samples arrive from the Video Encoder Callback thread while audio samples
  * arrive from the Audio Encoder drain thread (see docs/ARCHITECTURE.md's thread model) —
- * every method here that touches muxer state is `@Synchronized`.
+ * rather than a shared lock (which made the calling encoder thread block on synchronous
+ * disk I/O inside the critical section), every method that touches muxer state instead
+ * runs exclusively on [ioExecutor]'s single worker thread; callers only do the minimal
+ * thread-safe copy ([toPendingSample]) before handing off. See [ioExecutor]'s own doc for
+ * why the queue is bounded and the rejection handler blocks rather than runs inline.
  *
  * **確信度の明示 / known limitation**: rotating both tracks at *exactly* the same
  * instant with zero loss/duplication requires routing in-flight samples from either
@@ -54,7 +58,32 @@ class SegmentedMuxerController(
     )
 
     private val rotationPlanner = SegmentRotationPlanner(segmentDurationUs)
-    private val lock = Any()
+
+    // Single worker thread is what lets every method below mutate currentMuxer/started/
+    // pendingSamples/rotation state without synchronized — only ever one thread touches
+    // them. The queue is bounded (unlike Executors.newSingleThreadExecutor()'s unbounded
+    // LinkedBlockingQueue) so a stalled writeSampleData (slow storage, segment-rotation
+    // MediaMuxer.start() hiccup) can't let queued per-sample allocateDirect() copies grow
+    // without limit. The custom handler blocks the *producer* thread (video/audio encoder
+    // callback thread) on queue.put() when full, rather than using CallerRunsPolicy — that
+    // would run the rejected task on the producer thread while the worker thread might
+    // still be mid-task, i.e. two threads touching the unsynchronized state at once. A
+    // late sample arriving after stop() has already shut the executor down (real race:
+    // AudioEncoder.stop()'s 3s join can time out and return while its drain thread is
+    // still emitting callbacks — see RecordingPipeline's stop sequence) is discarded
+    // silently instead of throwing RejectedExecutionException.
+    private val ioExecutor = java.util.concurrent.ThreadPoolExecutor(
+        1,
+        1,
+        0L,
+        java.util.concurrent.TimeUnit.MILLISECONDS,
+        java.util.concurrent.LinkedBlockingQueue(MAX_QUEUED_IO_TASKS),
+        java.util.concurrent.RejectedExecutionHandler { runnable, executor ->
+            if (!executor.isShutdown) {
+                executor.queue.put(runnable)
+            }
+        },
+    )
 
     private var videoFormat: MediaFormat? = null
     private var audioFormat: MediaFormat? = null
@@ -73,14 +102,18 @@ class SegmentedMuxerController(
     private var oldAudioTrack = -1
     private var samplesRoutedToNewSinceRotation = 0
 
-    fun onVideoFormatChanged(format: MediaFormat) = synchronized(lock) {
-        videoFormat = format
-        tryStart()
+    fun onVideoFormatChanged(format: MediaFormat) {
+        ioExecutor.execute {
+            videoFormat = format
+            tryStart()
+        }
     }
 
-    fun onAudioFormatChanged(format: MediaFormat) = synchronized(lock) {
-        audioFormat = format
-        tryStart()
+    fun onAudioFormatChanged(format: MediaFormat) {
+        ioExecutor.execute {
+            audioFormat = format
+            tryStart()
+        }
     }
 
     private fun tryStart() {
@@ -104,44 +137,50 @@ class SegmentedMuxerController(
         pendingSamples.clear()
     }
 
-    fun onVideoSample(buffer: ByteBuffer, bufferInfo: MediaCodec.BufferInfo) = synchronized(lock) {
-        if (!started) {
-            pendingSamples += toPendingSample(true, buffer, bufferInfo)
-            return@synchronized
-        }
+    fun onVideoSample(buffer: ByteBuffer, bufferInfo: MediaCodec.BufferInfo) {
+        val sample = toPendingSample(true, buffer, bufferInfo)
+        ioExecutor.execute {
+            if (!started) {
+                pendingSamples += sample
+                return@execute
+            }
 
-        // A rotation may be mid-flight: route via MuxerSampleRouter, which encodes the
-        // straggler rule — a sample from before the boundary (the other track's thread
-        // hadn't caught up yet when the video thread triggered rotation) MUST go to the
-        // old muxer, never the new one, or that segment's audio/video would gain samples
-        // that belong to the previous file.
-        val boundary = rotationBoundaryPtsUs
-        if (boundary != null) {
-            routeDuringRotation(true, buffer, bufferInfo, boundary)
-            return@synchronized
-        }
+            // A rotation may be mid-flight: route via MuxerSampleRouter, which encodes the
+            // straggler rule — a sample from before the boundary (the other track's thread
+            // hadn't caught up yet when the video thread triggered rotation) MUST go to the
+            // old muxer, never the new one, or that segment's audio/video would gain samples
+            // that belong to the previous file.
+            val boundary = rotationBoundaryPtsUs
+            if (boundary != null) {
+                routeDuringRotation(true, sample.buffer, sample.bufferInfo, boundary)
+                return@execute
+            }
 
-        val isKeyframe = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-        val decision = rotationPlanner.onVideoFrame(bufferInfo.presentationTimeUs, isKeyframe)
-        if (decision is SegmentRotationPlanner.Decision.Rotate) {
-            rotate(bufferInfo.presentationTimeUs, decision.newSegmentIndex)
-            routeDuringRotation(true, buffer, bufferInfo, bufferInfo.presentationTimeUs)
-        } else {
-            writeToCurrent(true, buffer, bufferInfo)
+            val isKeyframe = (sample.bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+            val decision = rotationPlanner.onVideoFrame(sample.bufferInfo.presentationTimeUs, isKeyframe)
+            if (decision is SegmentRotationPlanner.Decision.Rotate) {
+                rotate(sample.bufferInfo.presentationTimeUs, decision.newSegmentIndex)
+                routeDuringRotation(true, sample.buffer, sample.bufferInfo, sample.bufferInfo.presentationTimeUs)
+            } else {
+                writeToCurrent(true, sample.buffer, sample.bufferInfo)
+            }
         }
     }
 
-    fun onAudioSample(buffer: ByteBuffer, bufferInfo: MediaCodec.BufferInfo) = synchronized(lock) {
-        if (!started) {
-            pendingSamples += toPendingSample(false, buffer, bufferInfo)
-            return@synchronized
-        }
+    fun onAudioSample(buffer: ByteBuffer, bufferInfo: MediaCodec.BufferInfo) {
+        val sample = toPendingSample(false, buffer, bufferInfo)
+        ioExecutor.execute {
+            if (!started) {
+                pendingSamples += sample
+                return@execute
+            }
 
-        val boundary = rotationBoundaryPtsUs
-        if (boundary != null) {
-            routeDuringRotation(false, buffer, bufferInfo, boundary)
-        } else {
-            writeToCurrent(false, buffer, bufferInfo)
+            val boundary = rotationBoundaryPtsUs
+            if (boundary != null) {
+                routeDuringRotation(false, sample.buffer, sample.bufferInfo, boundary)
+            } else {
+                writeToCurrent(false, sample.buffer, sample.bufferInfo)
+            }
         }
     }
 
@@ -161,18 +200,27 @@ class SegmentedMuxerController(
     }
 
     /** §4.4's stop sequence: caller has already sent EOS to both encoders and drained them. */
-    fun stop() = synchronized(lock) {
-        currentMuxer?.let { muxer ->
-            muxer.stop()
-            muxer.release()
+    fun stop() {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        ioExecutor.execute {
+            try {
+                currentMuxer?.let { muxer ->
+                    muxer.stop()
+                    muxer.release()
+                }
+                oldMuxer?.let { muxer ->
+                    muxer.stop()
+                    muxer.release()
+                }
+                currentMuxer = null
+                oldMuxer = null
+                started = false
+            } finally {
+                latch.countDown()
+            }
         }
-        oldMuxer?.let { muxer ->
-            muxer.stop()
-            muxer.release()
-        }
-        currentMuxer = null
-        oldMuxer = null
-        started = false
+        latch.await()
+        ioExecutor.shutdown()
     }
 
     private fun rotate(boundaryPtsUs: Long, newSegmentIndex: Int) {
@@ -246,5 +294,10 @@ class SegmentedMuxerController(
     companion object {
         const val DEFAULT_SEGMENT_DURATION_US = 5 * 60 * 1_000_000L // §4.4 default: 5 minutes
         const val OLD_MUXER_DRAIN_GRACE_SAMPLES = 8
+
+        // ~400ms of combined video+audio samples at worst-case rates (60fps video +
+        // ~94 audio blocks/sec @ 48kHz/512-frame blocks) — enough headroom to absorb a
+        // brief I/O stall asynchronously before backpressure kicks in.
+        const val MAX_QUEUED_IO_TASKS = 64
     }
 }

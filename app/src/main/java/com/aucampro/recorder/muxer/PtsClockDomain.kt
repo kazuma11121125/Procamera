@@ -1,4 +1,4 @@
-package com.procamera.recorder.muxer
+package com.aucampro.recorder.muxer
 
 /**
  * Normalizes Video and Audio presentation timestamps onto a single epoch (recording

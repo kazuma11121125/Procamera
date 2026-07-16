@@ -1,4 +1,4 @@
-package com.procamera.recorder.camera
+package com.aucampro.recorder.camera
 
 import com.google.common.truth.Truth.assertThat
 import org.junit.Test

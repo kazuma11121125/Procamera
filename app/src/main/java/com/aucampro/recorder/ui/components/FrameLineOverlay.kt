@@ -1,4 +1,4 @@
-package com.procamera.recorder.ui.components
+package com.aucampro.recorder.ui.components
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.runtime.Composable

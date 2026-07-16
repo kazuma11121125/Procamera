@@ -1,4 +1,4 @@
-package com.procamera.recorder.ui.components
+package com.aucampro.recorder.ui.components
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.runtime.Composable
@@ -7,9 +7,9 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.dp
-import com.procamera.recorder.camera.FocusController
-import com.procamera.recorder.ui.theme.MeterGreen
-import com.procamera.recorder.ui.viewmodel.FocusIndicator
+import com.aucampro.recorder.camera.FocusController
+import com.aucampro.recorder.ui.theme.MeterGreen
+import com.aucampro.recorder.ui.viewmodel.FocusIndicator
 
 /**
  * §フォーカス位置表示 — a corner-bracket reticle at [FocusIndicator.normalizedX]/

@@ -7,7 +7,7 @@
 
 #include "buffer/SpscRingBuffer.h"
 
-using procamera::SpscRingBuffer;
+using aucampro::SpscRingBuffer;
 
 TEST(SpscRingBufferTest, CapacityRoundsUpToPowerOfTwo) {
     SpscRingBuffer<int> rb(10);

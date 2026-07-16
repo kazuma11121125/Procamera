@@ -5,7 +5,7 @@
 
 #include "common/Log.h"
 
-namespace procamera {
+namespace aucampro {
 
 OboeFullDuplexEngine::OboeFullDuplexEngine()
     : highPassFilter_(kSampleRate, kChannelCount),
@@ -71,22 +71,22 @@ Result<std::shared_ptr<oboe::AudioStream>, std::string> OboeFullDuplexEngine::op
         std::shared_ptr<oboe::AudioStream> stream;
         const oboe::Result openResult = builder.openStream(stream);
         if (openResult != oboe::Result::OK) {
-            PROCAMERA_LOGW("openInputStream attempt [%s] failed: %s", attempt.description,
+            AUCAMPRO_LOGW("openInputStream attempt [%s] failed: %s", attempt.description,
                             oboe::convertToText(openResult));
             continue;
         }
 
         if (&attempt != &attempts[0]) {
-            PROCAMERA_LOGW("Input stream opened via fallback: %s", attempt.description);
+            AUCAMPRO_LOGW("Input stream opened via fallback: %s", attempt.description);
         }
         // The device may still silently grant a different config than requested even on
         // success (documented AAudio behavior) — surface that too rather than assume.
         if (stream->getSharingMode() != attempt.sharingMode) {
-            PROCAMERA_LOGW("Input stream SharingMode downgraded by OS to %d",
+            AUCAMPRO_LOGW("Input stream SharingMode downgraded by OS to %d",
                             static_cast<int>(stream->getSharingMode()));
         }
         if (stream->getInputPreset() != attempt.inputPreset) {
-            PROCAMERA_LOGW("Input stream InputPreset downgraded by OS to %d",
+            AUCAMPRO_LOGW("Input stream InputPreset downgraded by OS to %d",
                             static_cast<int>(stream->getInputPreset()));
         }
 
@@ -98,7 +98,7 @@ Result<std::shared_ptr<oboe::AudioStream>, std::string> OboeFullDuplexEngine::op
         // fail loudly here rather than silently misinterpret e.g. a mono stream as
         // interleaved stereo (which would corrupt every sample, not just degrade quality).
         if (stream->getChannelCount() != kChannelCount || stream->getSampleRate() != kSampleRate) {
-            PROCAMERA_LOGE("Input stream opened with unexpected config: channels=%d rate=%d (expected %d/%d)",
+            AUCAMPRO_LOGE("Input stream opened with unexpected config: channels=%d rate=%d (expected %d/%d)",
                             stream->getChannelCount(), stream->getSampleRate(), kChannelCount, kSampleRate);
             stream->close();
             return Result<std::shared_ptr<oboe::AudioStream>, std::string>::Err(
@@ -111,7 +111,7 @@ Result<std::shared_ptr<oboe::AudioStream>, std::string> OboeFullDuplexEngine::op
         // check whether the "stereo" stream we open is genuinely a 2-mic array device or a
         // mono device AAudio is silently channel-converting (which would explain a
         // consistently-silent second channel far better than the InputPreset choice does).
-        PROCAMERA_LOGI("Input stream opened: deviceId=%d channelCount=%d sampleRate=%d",
+        AUCAMPRO_LOGI("Input stream opened: deviceId=%d channelCount=%d sampleRate=%d",
                         stream->getDeviceId(), stream->getChannelCount(), stream->getSampleRate());
 
         return Result<std::shared_ptr<oboe::AudioStream>, std::string>::Ok(stream);
@@ -329,8 +329,8 @@ void OboeFullDuplexEngine::onErrorAfterClose(oboe::AudioStream *stream, oboe::Re
     // new device" orchestration happens in Kotlin's AudioDeviceRouter (§4.2), which
     // observes the disconnect via AudioManager.registerAudioDeviceCallback and drives
     // reopenInputStream()/insertSilence() from a normal coroutine context.
-    PROCAMERA_LOGW("Stream closed after error: %s (direction=%d)", oboe::convertToText(error),
+    AUCAMPRO_LOGW("Stream closed after error: %s (direction=%d)", oboe::convertToText(error),
                     static_cast<int>(stream->getDirection()));
 }
 
-}  // namespace procamera
+}  // namespace aucampro

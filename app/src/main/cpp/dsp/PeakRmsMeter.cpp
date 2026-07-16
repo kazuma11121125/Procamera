@@ -2,7 +2,7 @@
 
 #include <cmath>
 
-namespace procamera {
+namespace aucampro {
 
 namespace {
 constexpr float kSilenceFloorDb = -100.0f;
@@ -43,4 +43,4 @@ void PeakRmsMeter::process(const float *interleaved, size_t frameCount, int chan
     }
 }
 
-}  // namespace procamera
+}  // namespace aucampro

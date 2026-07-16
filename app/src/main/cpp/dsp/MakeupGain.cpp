@@ -2,7 +2,7 @@
 
 #include <cmath>
 
-namespace procamera {
+namespace aucampro {
 
 void MakeupGain::setGainDb(float gainDb) {
     gainLinear_.store(std::pow(10.0f, gainDb / 20.0f), std::memory_order_relaxed);
@@ -16,4 +16,4 @@ void MakeupGain::process(float *interleaved, size_t sampleCount) const {
     }
 }
 
-}  // namespace procamera
+}  // namespace aucampro

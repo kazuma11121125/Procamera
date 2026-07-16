@@ -3,7 +3,7 @@
 #include <atomic>
 #include <cstddef>
 
-namespace procamera {
+namespace aucampro {
 
 // Manual digital input-gain (record-level) stage. Applied first in the chain — before
 // the EQ and SafetyLimiter — so the user's chosen level is what those downstream stages
@@ -36,4 +36,4 @@ private:
     std::atomic<float> gainLinear_{1.0f};
 };
 
-}  // namespace procamera
+}  // namespace aucampro

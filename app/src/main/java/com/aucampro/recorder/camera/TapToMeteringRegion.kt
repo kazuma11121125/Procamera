@@ -1,4 +1,4 @@
-package com.procamera.recorder.camera
+package com.aucampro.recorder.camera
 
 /** Plain (x, y, width, height) in sensor active-array pixel coordinates. */
 data class MeteringRegion(val x: Int, val y: Int, val width: Int, val height: Int)

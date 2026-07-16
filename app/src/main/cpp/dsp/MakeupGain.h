@@ -3,7 +3,7 @@
 #include <atomic>
 #include <cstddef>
 
-namespace procamera {
+namespace aucampro {
 
 // Optional, user-facing loudness boost — applied after the 3-band EQ but before
 // SafetyLimiter (§4.2), so any overs it introduces are still caught by the limiter's
@@ -29,4 +29,4 @@ private:
     std::atomic<float> gainLinear_{1.0f};
 };
 
-}  // namespace procamera
+}  // namespace aucampro

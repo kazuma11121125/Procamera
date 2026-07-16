@@ -2,7 +2,7 @@
 
 #include <cmath>
 
-namespace procamera {
+namespace aucampro {
 
 BiquadCoeffs computeRbjPeakingCoeffs(double sampleRateHz, double centerFreqHz, double q, double gainDb) {
     // RBJ Audio Cookbook "Peaking EQ" formula.
@@ -133,4 +133,4 @@ void ThreeBandEq::process(float *interleaved, size_t frameCount) {
     }
 }
 
-}  // namespace procamera
+}  // namespace aucampro

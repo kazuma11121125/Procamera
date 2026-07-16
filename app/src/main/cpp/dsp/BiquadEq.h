@@ -6,7 +6,7 @@
 
 #include "common/TripleBuffer.h"
 
-namespace procamera {
+namespace aucampro {
 
 // RBJ Audio Cookbook peaking-EQ biquad coefficients (a0-normalized: a0 is always 1 and
 // omitted). See https://www.w3.org/andrewz/audioeq-cookbook/audio-eq-cookbook.html.
@@ -79,4 +79,4 @@ private:
     std::vector<std::array<FilterHistory, kNumBands>> historyPerChannel_;
 };
 
-}  // namespace procamera
+}  // namespace aucampro

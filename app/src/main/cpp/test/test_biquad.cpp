@@ -5,8 +5,8 @@
 
 #include "dsp/BiquadEq.h"
 
-using procamera::BiquadCoeffs;
-using procamera::computeRbjPeakingCoeffs;
+using aucampro::BiquadCoeffs;
+using aucampro::computeRbjPeakingCoeffs;
 
 namespace {
 
@@ -93,7 +93,7 @@ TEST(BiquadEqTest, RampConvergesExactlyToRequestedGainAfterSettling) {
     constexpr float kGainDb = 9.0f;
     constexpr int kMono = 1;
 
-    procamera::ThreeBandEq eq(kSampleRate, kMono);
+    aucampro::ThreeBandEq eq(kSampleRate, kMono);
     // Flatten the other two bands to 0dB so only the band under test shapes the response.
     eq.setBandParams(0, 80.0f, 0.8f, 0.0f);
     eq.setBandParams(2, 8000.0f, 0.7f, 0.0f);
@@ -101,7 +101,7 @@ TEST(BiquadEqTest, RampConvergesExactlyToRequestedGainAfterSettling) {
 
     // Run well past kRampSamples so the coefficient ramp has fully settled before
     // measurement begins.
-    std::vector<float> warmup(procamera::ThreeBandEq::kRampSamples * 4, 0.0f);
+    std::vector<float> warmup(aucampro::ThreeBandEq::kRampSamples * 4, 0.0f);
     eq.process(warmup.data(), warmup.size());
 
     constexpr int kSettleCycles = 200;
@@ -136,7 +136,7 @@ TEST(BiquadEqTest, RampConvergesExactlyToRequestedGainAfterSettling) {
 TEST(BiquadEqTest, DefaultThreeBandSpecValuesProduceStableOutput) {
     // Regression guard for the §4.2 default preset (Low 80Hz Q0.8 -6dB / Mid 1500Hz Q1.2
     // +3dB / High 8000Hz Q0.7 -4dB): construction must not produce NaN/Inf coefficients.
-    procamera::ThreeBandEq eq(48000.0, 2);
+    aucampro::ThreeBandEq eq(48000.0, 2);
     std::vector<float> block(256 * 2, 0.1f);
     // Run enough blocks to fully clear the coefficient ramp (kRampSamples=240) and
     // confirm steady-state processing stays finite.

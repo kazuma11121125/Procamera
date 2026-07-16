@@ -2,7 +2,7 @@
 
 #include <cmath>
 
-namespace procamera {
+namespace aucampro {
 
 namespace {
 // tanh() saturates to exactly 1.0f in float32 precision for large-but-finite arguments,
@@ -30,4 +30,4 @@ void SafetyLimiter::process(float *interleaved, size_t sampleCount) {
     }
 }
 
-}  // namespace procamera
+}  // namespace aucampro

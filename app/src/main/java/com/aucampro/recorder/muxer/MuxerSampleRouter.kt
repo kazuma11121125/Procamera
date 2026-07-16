@@ -1,4 +1,4 @@
-package com.procamera.recorder.muxer
+package com.aucampro.recorder.muxer
 
 /**
  * Pure extraction of [SegmentedMuxerController]'s sample-routing decision — the logic

@@ -1,4 +1,4 @@
-package com.procamera.recorder.ui.components
+package com.aucampro.recorder.ui.components
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -33,14 +33,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.procamera.recorder.ui.theme.MeterGreen
-import com.procamera.recorder.ui.theme.MeterOrange
-import com.procamera.recorder.ui.theme.MeterRed
-import com.procamera.recorder.ui.theme.MeterYellow
-import com.procamera.recorder.ui.theme.OnSurfacePrimary
-import com.procamera.recorder.ui.theme.OnSurfaceSecondary
-import com.procamera.recorder.ui.theme.SurfaceBlack
-import com.procamera.recorder.ui.theme.SurfaceVariant
+import com.aucampro.recorder.ui.theme.MeterGreen
+import com.aucampro.recorder.ui.theme.MeterOrange
+import com.aucampro.recorder.ui.theme.MeterRed
+import com.aucampro.recorder.ui.theme.MeterYellow
+import com.aucampro.recorder.ui.theme.OnSurfacePrimary
+import com.aucampro.recorder.ui.theme.OnSurfaceSecondary
+import com.aucampro.recorder.ui.theme.SurfaceBlack
+import com.aucampro.recorder.ui.theme.SurfaceVariant
 
 /**
  * Segmented (LED-bridge style) vertical audio level meter (§4.5), styled after a field
@@ -192,7 +192,7 @@ private val TickDbs = listOf(0f, -6f, -12f, -24f, -48f)
  * **実機で発見**: this used to allocate a fresh `List` and `android.graphics.Paint` on
  * every single Canvas draw — at the meter's ~30Hz update rate, that's 30+ allocations/sec
  * purely for tick-label drawing, which measurably adds to GC pressure shared with the
- * video/audio encoder threads (see [com.procamera.recorder.encoder.VideoEncoder]'s
+ * video/audio encoder threads (see [com.aucampro.recorder.encoder.VideoEncoder]'s
  * `BufferInfo` reuse doc for the same finding on the encoder side). [TickDbs] is now a
  * module-level constant and [paint] is created once via `remember` and only mutated
  * (never reallocated) per draw.

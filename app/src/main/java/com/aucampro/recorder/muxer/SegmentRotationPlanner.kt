@@ -1,4 +1,4 @@
-package com.procamera.recorder.muxer
+package com.aucampro.recorder.muxer
 
 /**
  * Pure decision logic for §4.4's seamless segment rotation: decides *when* to rotate to a

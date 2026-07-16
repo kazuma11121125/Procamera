@@ -1,4 +1,4 @@
-package com.procamera.recorder.camera
+package com.aucampro.recorder.camera
 
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
@@ -336,7 +336,7 @@ class CameraCapabilityInspector(private val cameraManager: CameraManager) {
      * correct for MediaCodec availability.
      *
      * **16:9-only, by design**: every candidate below shares the fixed preview buffer's
-     * 16:9 shape (see [com.procamera.recorder.ui.components.PreviewSurfaceView]'s doc for
+     * 16:9 shape (see [com.aucampro.recorder.ui.components.PreviewSurfaceView]'s doc for
      * why that buffer is fixed). Non-16:9 candidates (21:9 2560×1080, 4:3 1440×1080, 1:1
      * 1080×1080) used to be offered here and were removed **実機で発見(2026-07-16)**:
      * recording at any of them added a differently-shaped encoder stream alongside the

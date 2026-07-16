@@ -1,4 +1,4 @@
-package com.procamera.recorder.ui.viewmodel
+package com.aucampro.recorder.ui.viewmodel
 
 import android.Manifest
 import android.app.Application
@@ -11,12 +11,12 @@ import android.util.Log
 import android.view.Surface
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.procamera.recorder.camera.CameraCapabilityInspector
-import com.procamera.recorder.camera.CameraParams
-import com.procamera.recorder.camera.CaptureRangeClamper
-import com.procamera.recorder.pipeline.RecordingPipeline
-import com.procamera.recorder.utils.ThermalMonitor
-import com.procamera.recorder.utils.UserPreferencesStore
+import com.aucampro.recorder.camera.CameraCapabilityInspector
+import com.aucampro.recorder.camera.CameraParams
+import com.aucampro.recorder.camera.CaptureRangeClamper
+import com.aucampro.recorder.pipeline.RecordingPipeline
+import com.aucampro.recorder.utils.ThermalMonitor
+import com.aucampro.recorder.utils.UserPreferencesStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -32,7 +32,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * ViewModel for [com.procamera.recorder.ui.MainScreen].
+ * ViewModel for [com.aucampro.recorder.ui.MainScreen].
  *
  * Phase 4 UI additions vs the original (smoke-test) version:
  * - [switchLens]: stops current preview session and restarts with a different camera.
@@ -102,8 +102,8 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         // Registers this ViewModel's single RecordingPipeline instance with the
         // Application-level crash handler so an uncaught exception can attempt a
         // best-effort finalize of whatever segment is currently open (§4.6) — see
-        // ProCameraApplication and RecordingPipeline.emergencyFinalizeCurrentSegment's docs.
-        (app as? com.procamera.recorder.ProCameraApplication)?.activeRecordingPipeline = pipeline
+        // AuCamPROApplication and RecordingPipeline.emergencyFinalizeCurrentSegment's docs.
+        (app as? com.aucampro.recorder.AuCamPROApplication)?.activeRecordingPipeline = pipeline
 
         // §4.6: monitor for the whole time this screen is up (not just while recording —
         // extended preview during setup/soundcheck can heat the device too), surfacing a
@@ -168,7 +168,7 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         pipeline.onFocusIndicatorChanged = { x, y, indicatorState ->
             _uiState.update { it.copy(focusIndicator = FocusIndicator(x, y, indicatorState)) }
             focusIndicatorHideJob?.cancel()
-            if (indicatorState != com.procamera.recorder.camera.FocusController.FocusIndicatorState.Scanning) {
+            if (indicatorState != com.aucampro.recorder.camera.FocusController.FocusIndicatorState.Scanning) {
                 focusIndicatorHideJob = viewModelScope.launch {
                     delay(1500L)
                     _uiState.update { it.copy(focusIndicator = null) }
@@ -473,11 +473,31 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
                         startRecordingJobs()
                     }
                     is RecordingPipeline.Event.Failed -> {
-                        _uiState.update {
-                            it.copy(recordingState = RecordingUiState.Previewing, errorMessage = "録画エラー: ${event.message}")
-                        }
                         stopRecordingJobs()
                         stopRecordingService()
+                        if (event.sessionStopped) {
+                            // The pipeline already tore the camera session down (mid-recording
+                            // encoder error, or a failure after the session was reconfigured
+                            // for recording) — restart preview the same way a normal
+                            // stopRecording() does, or the viewfinder is left black/frozen.
+                            // pipeline.startPreview() is suspend, and this `event ->` lambda
+                            // is a plain callback (not a coroutine body), hence the nested launch.
+                            _uiState.update { it.copy(errorMessage = "録画エラー: ${event.message}") }
+                            viewModelScope.launch {
+                                val surface = previewSurface
+                                val caps = surface?.let { pipeline.startPreview(it, _uiState.value.toCameraParams()) }
+                                _uiState.update {
+                                    it.copy(recordingState = if (caps != null) RecordingUiState.Previewing else RecordingUiState.Idle)
+                                }
+                            }
+                        } else {
+                            // Early guard-clause failure (no lens/capabilities/etc. yet) —
+                            // the existing preview session was never touched, so there is
+                            // nothing to restart.
+                            _uiState.update {
+                                it.copy(recordingState = RecordingUiState.Previewing, errorMessage = "録画エラー: ${event.message}")
+                            }
+                        }
                     }
                     RecordingPipeline.Event.Stopped -> {}
                     is RecordingPipeline.Event.Stats -> {
@@ -642,7 +662,7 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
      * **実機で発見**: [setIso]/[setZoom]/etc. above are wired directly to Compose `Slider`
      * `onValueChange`, which fires on every pointer-move tick during a drag (tens of times
      * per second) — each call used to synchronously reach
-     * [com.procamera.recorder.camera.CameraSessionController.updateCaptureParams]'s
+     * [com.aucampro.recorder.camera.CameraSessionController.updateCaptureParams]'s
      * `CameraCaptureSession.setRepeatingRequest`, a cross-process Binder call into the
      * camera HAL. Dragging a slider was flooding the HAL with repeating-request
      * resubmissions on the main thread, correlating with a real-device-reported sharp FPS
@@ -778,8 +798,8 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         _uiState.update { it.copy(settings = it.settings.copy(frameLineAspectRatio = ratio)) }
     }
 
-    /** Settings sheet mic picker (§4.2) — see [com.procamera.recorder.audio.AudioDeviceRouter.InputKind]'s doc. */
-    fun setAudioInputPreference(kind: com.procamera.recorder.audio.AudioDeviceRouter.InputKind) {
+    /** Settings sheet mic picker (§4.2) — see [com.aucampro.recorder.audio.AudioDeviceRouter.InputKind]'s doc. */
+    fun setAudioInputPreference(kind: com.aucampro.recorder.audio.AudioDeviceRouter.InputKind) {
         _uiState.update { it.copy(settings = it.settings.copy(audioInputPreference = kind)) }
         pipeline.setPreferredInputKind(kind)
     }
@@ -814,13 +834,13 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         val context = getApplication<Application>()
         androidx.core.content.ContextCompat.startForegroundService(
             context,
-            android.content.Intent(context, com.procamera.recorder.service.RecordingService::class.java),
+            android.content.Intent(context, com.aucampro.recorder.service.RecordingService::class.java),
         )
     }
 
     private fun stopRecordingService() {
         val context = getApplication<Application>()
-        context.stopService(android.content.Intent(context, com.procamera.recorder.service.RecordingService::class.java))
+        context.stopService(android.content.Intent(context, com.aucampro.recorder.service.RecordingService::class.java))
     }
 
     /**
@@ -941,7 +961,7 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         // doc says is NOT covered — the pipeline is dying here too), at least don't leave
         // a stuck notification/wake lock behind if the process happens to survive this.
         stopRecordingService()
-        val app = getApplication<Application>() as? com.procamera.recorder.ProCameraApplication
+        val app = getApplication<Application>() as? com.aucampro.recorder.AuCamPROApplication
         if (app?.activeRecordingPipeline === pipeline) app.activeRecordingPipeline = null
     }
 
@@ -978,7 +998,7 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         val wbAuto: Boolean,
         val afAuto: Boolean,
         val frameLineAspectRatio: FrameLineAspectRatio,
-        val audioInputPreference: com.procamera.recorder.audio.AudioDeviceRouter.InputKind,
+        val audioInputPreference: com.aucampro.recorder.audio.AudioDeviceRouter.InputKind,
         val inputGainDb: Float,
         val makeupGainDb: Float,
         val highPassEnabled: Boolean,

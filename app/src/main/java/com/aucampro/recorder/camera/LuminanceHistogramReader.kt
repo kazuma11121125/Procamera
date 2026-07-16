@@ -1,4 +1,4 @@
-package com.procamera.recorder.camera
+package com.aucampro.recorder.camera
 
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCharacteristics
@@ -92,12 +92,15 @@ class LuminanceHistogramReader(
             // Sparse-sample every 2nd row/column too — this reader is already tiny
             // (smallestYuvSize), so this is a second, cheap layer of throttling on top of
             // the frame-rate throttling above, not load-bearing on its own.
+            val byteArray = ByteArray(buffer.remaining())
+            buffer.get(byteArray)
+
             var row = 0
             while (row < height) {
                 var col = 0
                 val rowOffset = row * rowStride
                 while (col < width) {
-                    val luma = buffer.get(rowOffset + col * pixelStride).toInt() and 0xFF
+                    val luma = byteArray[rowOffset + col * pixelStride].toInt() and 0xFF
                     val bin = (luma * HISTOGRAM_BIN_COUNT / 256).coerceIn(0, HISTOGRAM_BIN_COUNT - 1)
                     counts[bin]++
                     col += 2

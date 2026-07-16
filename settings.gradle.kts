@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "ProCamera"
+rootProject.name = "AuCamPRO"
 include(":app")

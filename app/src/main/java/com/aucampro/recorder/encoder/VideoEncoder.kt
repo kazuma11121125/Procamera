@@ -1,10 +1,10 @@
-package com.procamera.recorder.encoder
+package com.aucampro.recorder.encoder
 
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.view.Surface
-import com.procamera.recorder.muxer.PtsClockDomain
+import com.aucampro.recorder.muxer.PtsClockDomain
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit

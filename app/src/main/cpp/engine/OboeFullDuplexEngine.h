@@ -16,7 +16,7 @@
 #include "dsp/PeakRmsMeter.h"
 #include "dsp/SafetyLimiter.h"
 
-namespace procamera {
+namespace aucampro {
 
 // Owns the Oboe input stream (mic capture, always on while recording) and an optional
 // output stream (headphone monitor passthrough, §4.2). The input stream's audio callback
@@ -179,4 +179,4 @@ private:
     std::atomic<int32_t> ringBufferOverrunCount_{0};
 };
 
-}  // namespace procamera
+}  // namespace aucampro

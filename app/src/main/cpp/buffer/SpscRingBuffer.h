@@ -5,7 +5,7 @@
 #include <cstring>
 #include <memory>
 
-namespace procamera {
+namespace aucampro {
 
 // Single-Producer Single-Consumer lock-free ring buffer of trivially-copyable elements.
 //
@@ -135,4 +135,4 @@ private:
     alignas(kCacheLineSize) std::atomic<size_t> readIndex_{0};
 };
 
-}  // namespace procamera
+}  // namespace aucampro

@@ -2,7 +2,7 @@
 
 #include "common/Result.h"
 
-using procamera::Result;
+using aucampro::Result;
 
 TEST(ResultTest, OkCarriesValue) {
     auto r = Result<int, std::string>::Ok(42);

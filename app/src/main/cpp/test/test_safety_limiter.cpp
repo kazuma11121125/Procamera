@@ -5,7 +5,7 @@
 
 #include "dsp/SafetyLimiter.h"
 
-using procamera::SafetyLimiter;
+using aucampro::SafetyLimiter;
 
 namespace {
 float dbToLinear(float db) { return std::pow(10.0f, db / 20.0f); }

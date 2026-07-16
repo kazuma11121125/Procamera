@@ -1,4 +1,4 @@
-package com.procamera.recorder.ui.components
+package com.aucampro.recorder.ui.components
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -18,10 +18,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.procamera.recorder.ui.theme.Amber
-import com.procamera.recorder.ui.theme.OnSurfacePrimary
-import com.procamera.recorder.ui.theme.OnSurfaceSecondary
-import com.procamera.recorder.ui.theme.SliderTrackInactive
+import com.aucampro.recorder.ui.theme.Amber
+import com.aucampro.recorder.ui.theme.OnSurfacePrimary
+import com.aucampro.recorder.ui.theme.OnSurfaceSecondary
+import com.aucampro.recorder.ui.theme.SliderTrackInactive
 import kotlin.math.roundToInt
 
 /**

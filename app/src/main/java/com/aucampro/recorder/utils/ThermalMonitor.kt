@@ -1,4 +1,4 @@
-package com.procamera.recorder.utils
+package com.aucampro.recorder.utils
 
 import android.content.Context
 import android.os.Build

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">ProCamera</string>
+    <string name="app_name">AuCamPRO</string>
     <string name="recording_notification_channel">Recording</string>
 </resources>

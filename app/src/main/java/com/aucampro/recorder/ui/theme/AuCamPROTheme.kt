@@ -1,4 +1,4 @@
-package com.procamera.recorder.ui.theme
+package com.aucampro.recorder.ui.theme
 
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
@@ -6,7 +6,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 
 // ──────────────────────────────────────────────────────────────────────────────
-// ProCamera colour palette — professional dark camera UI
+// AuCamPRO colour palette — professional dark camera UI
 // ──────────────────────────────────────────────────────────────────────────────
 
 /** Almost-black surface matching pro camera app conventions. */
@@ -42,7 +42,7 @@ val MeterRed = Color(0xFFE53935)
 val SliderTrackInactive = Color(0xFF2A2F35)
 val SliderTrackActive = Amber
 
-private val ProCameraColorScheme = darkColorScheme(
+private val AuCamPROColorScheme = darkColorScheme(
     primary = Amber,
     onPrimary = Color(0xFF1A0E00),
     primaryContainer = AmberDim,
@@ -61,13 +61,13 @@ private val ProCameraColorScheme = darkColorScheme(
 )
 
 /**
- * App-wide theme for ProCamera. Every composable inside this theme has access to
+ * App-wide theme for AuCamPRO. Every composable inside this theme has access to
  * the professional dark colour scheme and Material 3 typography via [MaterialTheme].
  */
 @Composable
-fun ProCameraTheme(content: @Composable () -> Unit) {
+fun AuCamPROTheme(content: @Composable () -> Unit) {
     MaterialTheme(
-        colorScheme = ProCameraColorScheme,
+        colorScheme = AuCamPROColorScheme,
         content = content,
     )
 }

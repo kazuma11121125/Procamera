@@ -1,5 +1,6 @@
 package com.procamera.recorder.ui.viewmodel
 
+import androidx.compose.runtime.Immutable
 import android.net.Uri
 import com.procamera.recorder.audio.AudioDeviceRouter
 import com.procamera.recorder.camera.CameraCapabilityInspector
@@ -43,6 +44,7 @@ enum class RecordingUiState {
 // EQ band
 // ──────────────────────────────────────────────────────────────────────────────
 
+@Immutable
 data class EqBandState(
     val label: String,
     val freqHz: Float,
@@ -188,7 +190,27 @@ data class SettingsState(
 
 /**
  * Complete UI state for [com.procamera.recorder.ui.MainScreen].
+ *
+ * **実機で発見**: this class carries several fields the Compose compiler cannot prove
+ * stable on its own — `List<...>` ([availableLenses], [availableVideoConfigs],
+ * [eqBands]; Kotlin's `List` interface could be backed by a mutable implementation, so
+ * the compiler is conservative), plus `File`/`Uri`/`RggbChannelVector` (external
+ * Android/JDK types with no stability annotation of their own). Without an explicit
+ * promise, the compiler treats the *whole* data class as unstable — which means every
+ * composable taking `state: CameraUiState` as a parameter (nearly everything under
+ * [com.procamera.recorder.ui.MainScreen]) loses Compose's "skip recomposition if
+ * parameters are unchanged" optimization entirely, for every field, all the time. Since
+ * every mutation here already goes through `_uiState.update { it.copy(...) }` (never an
+ * in-place field mutation — see [com.procamera.recorder.ui.viewmodel.CameraControlViewModel]),
+ * this class genuinely *is* immutable in practice, so `@Immutable` is a safe, accurate
+ * promise, not just a suppression. Measured on-device: this alone was the largest single
+ * factor in a ~3-5x higher idle main-thread CPU cost versus a comparable native
+ * (non-Compose) camera app doing equivalent live metering (audio meter + level gauge) —
+ * every ~6-30Hz background state push (WB/AF auto-measurement, the meter poll, etc.) was
+ * forcing a defensive recompose of the entire panel tree instead of just the composable
+ * that actually reads the changed field.
  */
+@Immutable
 data class CameraUiState(
 
     // ── Recording state ──────────────────────────────────────────────────────

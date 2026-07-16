@@ -334,6 +334,30 @@ class CameraCapabilityInspector(private val cameraManager: CameraManager) {
      * capability queries via `CameraCharacteristics`) but the current implementation
      * delegates entirely to the device-global [isVideoConfigSupported] check, which is
      * correct for MediaCodec availability.
+     *
+     * **16:9-only, by design**: every candidate below shares the fixed preview buffer's
+     * 16:9 shape (see [com.procamera.recorder.ui.components.PreviewSurfaceView]'s doc for
+     * why that buffer is fixed). Non-16:9 candidates (21:9 2560×1080, 4:3 1440×1080, 1:1
+     * 1080×1080) used to be offered here and were removed **実機で発見(2026-07-16)**:
+     * recording at any of them added a differently-shaped encoder stream alongside the
+     * 16:9 preview stream in the same Camera2 session, and the crop-region/sensor-readout
+     * recomputation needed to satisfy both stream shapes at once visibly shifted the
+     * preview's FOV and re-triggered AF hunting at the moment the record button was
+     * pressed. A same-aspect-ratio preview was tried as a fix (matching the encoder's own
+     * shape instead of staying 16:9) but made things categorically worse: this device's
+     * Camera2 HAL rejects the resulting *two-non-16:9-PRIVATE-stream* session outright
+     * (`CameraCaptureSession.StateCallback#onConfigureFailed`, "Unsupported set of
+     * inputs/outputs provided") — confirmed both when reusing the encoder's exact
+     * resolution as the preview size AND when substituting a different, independently
+     * `dumpsys media.camera`-confirmed same-aspect-ratio preview size (960×720 for 4:3).
+     * The only session combination this HAL accepts is 16:9-preview + non-16:9-encoder,
+     * which is exactly what caused the original FOV/AF-hunt bug — so on this device
+     * there's no preview-buffer trick that both keeps non-16:9 recording and avoids the
+     * artifact. Removing the non-16:9 options is the trade-off actually made: simpler than
+     * eagerly holding the encoder surface in the session from preview-start to avoid the
+     * record-time rebuild entirely (which stayed unexplored as bigger in scope). If
+     * non-16:9 recording is wanted again later, re-verify each removed candidate's session
+     * combo on real hardware before restoring it — don't just uncomment these lines.
      */
     @Suppress("UNUSED_PARAMETER") // cameraId reserved for future per-camera codec queries
     fun supportedVideoConfigs(cameraId: String): List<VideoConfigCandidate> {
@@ -348,15 +372,9 @@ class CameraCapabilityInspector(private val cameraManager: CameraManager) {
             // so supportedVideoConfigs()'s descending-pixel-count sort put it FIRST — every
             // fresh install/preference-reset silently defaulted to a resolution that can
             // never actually record. Root cause traced via `dumpsys`/logcat on-device, not
-            // reproducible from a host build. The smaller non-16:9 options below (21:9,
-            // 4:3, 1:1) have not hit the same failure in testing so far, but haven't been
-            // exhaustively re-verified against the now-fixed preview buffer either —
-            // Phase5 real-device coverage should specifically re-check each one.
-            VideoConfigCandidate(MediaFormat.MIMETYPE_VIDEO_AVC,  2560, 1080, 30, 20_000_000), // 21:9
+            // reproducible from a host build.
             VideoConfigCandidate(MediaFormat.MIMETYPE_VIDEO_AVC,  1920, 1080, 60, 20_000_000), // 16:9
             VideoConfigCandidate(MediaFormat.MIMETYPE_VIDEO_AVC,  1920, 1080, 30, 10_000_000), // 16:9
-            VideoConfigCandidate(MediaFormat.MIMETYPE_VIDEO_AVC,  1440, 1080, 30, 10_000_000), // 4:3
-            VideoConfigCandidate(MediaFormat.MIMETYPE_VIDEO_AVC,  1080, 1080, 30,  8_000_000), // 1:1
             VideoConfigCandidate(MediaFormat.MIMETYPE_VIDEO_AVC,  1280,  720, 60,  8_000_000), // 16:9
         )
         return allCandidates

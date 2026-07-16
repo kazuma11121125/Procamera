@@ -28,8 +28,10 @@ import com.procamera.recorder.muxer.SegmentedMuxerController
 import com.procamera.recorder.ui.viewmodel.StorageLocation
 import java.io.File
 import java.nio.ByteBuffer
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
  * Unified camera/audio/encode/mux pipeline for Phase 4's full UI build.
@@ -475,7 +477,6 @@ class RecordingPipeline(private val context: Context) {
                         val gains = result.get(android.hardware.camera2.CaptureResult.COLOR_CORRECTION_GAINS)
                         if (gains != null) {
                             val k = ColorTemperatureConverter.rggbGainsToKelvin(gains)
-                            Log.d("RecordingPipeline", "Auto WB Measured: kelvin=$k, gains=[R=${gains.red}, G_even=${gains.greenEven}, G_odd=${gains.greenOdd}, B=${gains.blue}]")
                             Handler(Looper.getMainLooper()).post {
                                 onAutoWbGainsMeasured?.invoke(gains, k)
                             }
@@ -486,7 +487,6 @@ class RecordingPipeline(private val context: Context) {
                     if (currentParams?.afAuto == true) {
                         val focus = result.get(android.hardware.camera2.CaptureResult.LENS_FOCUS_DISTANCE)
                         if (focus != null) {
-                            Log.d("RecordingPipeline", "Auto AF Measured: focus=$focus")
                             Handler(Looper.getMainLooper()).post {
                                 onAutoFocusMeasured?.invoke(focus)
                             }
@@ -757,7 +757,7 @@ class RecordingPipeline(private val context: Context) {
      */
     suspend fun stopRecording() {
         if (pipelineState != PipelineState.RECORDING) return
-        sessionMutex.withLock { stopRecordingInternalLocked(restartPreview = true) }
+        sessionMutex.withLock { stopRecordingInternalLockedAsync() }
     }
 
     /**
@@ -925,7 +925,14 @@ class RecordingPipeline(private val context: Context) {
     // Internal helpers
     // ──────────────────────────────────────────────────────────────────────────────
 
-    /** Caller must already hold [sessionMutex] (see the two suspend wrappers and [stopAll]). */
+    /**
+     * Caller must already hold [sessionMutex] (see [stopAll]). Blocking — the encoder
+     * drain/muxer-finalize/MediaStore-export sequence below can take seconds, which is
+     * only acceptable because [stopAll] runs at `ViewModel.onCleared()` teardown, not on
+     * an input-dispatch-sensitive path. The interactive stop path uses
+     * [stopRecordingInternalLockedAsync] instead — see its doc for why this one can't
+     * just be reused there.
+     */
     private fun stopRecordingInternalLocked(restartPreview: Boolean) {
         // Camera session stops (see stop-sequence doc above); the audio *engine* deliberately
         // does NOT stop here anymore — it keeps running for the meter across the return to
@@ -960,12 +967,74 @@ class RecordingPipeline(private val context: Context) {
     }
 
     /**
+     * Caller must already hold [sessionMutex]. Interactive counterpart of
+     * [stopRecordingInternalLocked] used only by [stopRecording] (the REC-button/hardware-key
+     * path).
+     *
+     * **実機で発見**: [stopRecording] is `suspend` but is launched from
+     * `CameraControlViewModel`'s `viewModelScope.launch {}`, which defaults to
+     * `Dispatchers.Main.immediate` — so before this fix, every blocking call this sequence
+     * makes (encoder drain-and-stop, muxer finalize, and especially
+     * [exportToPublicMoviesIfRequested]'s synchronous MediaStore file copy) ran directly on
+     * the main thread. Confirmed on-device: a single stop press blocked `InputDispatcher`
+     * for 7-8 seconds — past Android's 5s ANR threshold — producing a real
+     * 「ProCamera」は応答していません dialog, and queuing up any REC key presses sent while
+     * blocked so they fired all at once (looking like start/stop was being ignored) once
+     * the main thread finally freed up.
+     *
+     * [sessionController.stop] deliberately stays on the calling (main) dispatcher rather
+     * than moving into the [withContext] block below: [CameraSessionController] is not
+     * internally synchronized against the camera-parameter setters (`setIso`/`setZoom`/...)
+     * that call [sessionController]'s methods synchronously from main — see its class doc.
+     * Moving just this call off-thread would race those setters over the same `session`/
+     * `device` fields. It's also not the source of the multi-second block (Camera2 session
+     * teardown is fast; the encoder/muxer/export work below is what's slow), so there's no
+     * benefit to moving it anyway.
+     *
+     * The blocking work below is captured into locals *before* entering [withContext], and
+     * [pipelineState]/the encoder-muxer fields are only mutated after it returns (back on
+     * main) — these fields are plain (non-`@Volatile`) `var`s relied on for single-thread
+     * (main) confinement elsewhere in this class (e.g. [selectVideoConfig]'s unguarded
+     * `pipelineState` read), so this keeps that invariant intact instead of trading one race
+     * for another.
+     */
+    private suspend fun stopRecordingInternalLockedAsync() {
+        sessionController.stop()
+
+        val video = videoEncoder
+        val audio = audioEncoder
+        val muxer = muxerController
+        val dir = currentOutputDir
+
+        withContext(Dispatchers.IO) {
+            video?.let { encoder ->
+                encoder.signalEndOfStream()
+                encoder.awaitEndOfStream()
+                encoder.stop()
+            }
+            audio?.stop()
+            muxer?.stop()
+            dir?.let { exportToPublicMoviesIfRequested(it) }
+        }
+
+        ptsClockDomain = null
+        videoEncoder = null
+        audioEncoder = null
+        muxerController = null
+        pipelineState = PipelineState.IDLE
+        currentOutputDir = null
+    }
+
+    /**
      * If [storageLocation] is [StorageLocation.PublicMovies], copies each finalised segment
      * `.mp4` out of the app-private [outputDir] into the shared `Movies/ProCamera` collection
      * via MediaStore (so it shows up in the gallery), then deletes the app-private copy.
-     * No-op for [StorageLocation.AppPrivate]. Runs synchronously — safe here since this is
-     * always called after encoders/muxer are already fully stopped and drained, off the
-     * main thread (`stopRecording()` is suspend and called from a background coroutine).
+     * No-op for [StorageLocation.AppPrivate]. Runs synchronously (blocking file I/O) — always
+     * called after encoders/muxer are already fully stopped and drained, so callers are
+     * responsible for making sure this doesn't run on the main thread: see
+     * [stopRecordingInternalLockedAsync]'s doc for the real-device ANR this caused when it
+     * didn't. [stopRecordingInternalLocked] (the [stopAll] teardown path) still calls this on
+     * whatever thread it's on, which is acceptable there per its own doc.
      */
     private fun exportToPublicMoviesIfRequested(outputDir: File) {
         if (storageLocation != StorageLocation.PublicMovies) return

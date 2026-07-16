@@ -866,7 +866,7 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
             var lastClippingDetectedMsL = 0L
             var lastClippingDetectedMsR = 0L
             while (isActive) {
-                delay(33L)
+                delay(METER_POLL_INTERVAL_MS)
                 val peakL = pipeline.nativeEngine.peakDb(CHANNEL_LEFT)
                 val peakR = pipeline.nativeEngine.peakDb(CHANNEL_RIGHT)
                 val rmsL = pipeline.nativeEngine.rmsDb(CHANNEL_LEFT)
@@ -1021,5 +1021,13 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         // ~30Hz cap on HAL-facing setRepeatingRequest churn from slider drags — see
         // pushCameraParamsThrottled's doc.
         const val CAMERA_PARAMS_THROTTLE_MS = 33L
+
+        // 実機で発見(atrace): the audio meter Canvas + peak-dB label recompose/redraw on
+        // every tick of this loop, for as long as preview is up (not just while recording)
+        // — a real, continuous cost even after the Canvas-text fix (see AudioMeterBar's
+        // doc). 20Hz (50ms) is still comfortably smooth for a VU-style meter (broadcast
+        // hardware meters commonly refresh 10-20Hz) and cuts this loop's — and therefore
+        // the meter composable's — steady-state tick rate by ~1/3 versus the previous 30Hz.
+        const val METER_POLL_INTERVAL_MS = 50L
     }
 }

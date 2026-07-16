@@ -670,16 +670,31 @@ private fun CaptureModeToggle(
 
 @Composable
 private fun RecIndicator(state: CameraUiState) {
-    val infiniteTransition = rememberInfiniteTransition(label = "rec_blink")
-    val alpha by infiniteTransition.animateFloat(
-        initialValue = 1f,
-        targetValue = 0.25f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(600, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse,
-        ),
-        label = "rec_blink_alpha",
-    )
+    // 実機で発見(atrace): rememberInfiniteTransition subscribes to Choreographer's VSync
+    // callback for as long as it's part of the composition — unconditionally creating one
+    // here meant this fired every single frame (~60Hz) forever, even while sitting in
+    // STANDBY with nothing blinking on screen (the resulting `alpha` was only ever *read*
+    // while state.isRecording, but the animation clock itself doesn't know that — it ran
+    // regardless). Measured via on-device atrace: "animation"/"Recomposer:animation"/
+    // "Choreographer#scheduleVsyncLocked" firing ~60/sec continuously, matching this exactly.
+    // Only building the transition while actually recording removes that permanent VSync
+    // subscription for the (much more common) non-recording case; the dot is a flat
+    // (non-blinking) grey when not recording anyway, so no animation is needed there.
+    val alpha = if (state.isRecording) {
+        val infiniteTransition = rememberInfiniteTransition(label = "rec_blink")
+        val blinkAlpha by infiniteTransition.animateFloat(
+            initialValue = 1f,
+            targetValue = 0.25f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(600, easing = LinearEasing),
+                repeatMode = RepeatMode.Reverse,
+            ),
+            label = "rec_blink_alpha",
+        )
+        blinkAlpha
+    } else {
+        1f
+    }
 
     Row(verticalAlignment = Alignment.CenterVertically) {
         // Red/grey dot

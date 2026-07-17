@@ -899,6 +899,16 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         meterJob = viewModelScope.launch(Dispatchers.Default) {
             var lastClippingDetectedMsL = 0L
             var lastClippingDetectedMsR = 0L
+            // Publish gating state — see the `shouldPublish` doc below (Fable re-investigation,
+            // PERF_REINVESTIGATION_2026-07-17.md §1) for why this exists on top of the
+            // 0.5dB quantizeDb() step above.
+            var lastPublishedSegRmsL = Int.MIN_VALUE
+            var lastPublishedSegRmsR = Int.MIN_VALUE
+            var lastPublishedSegPeakL = Int.MIN_VALUE
+            var lastPublishedSegPeakR = Int.MIN_VALUE
+            var lastPublishedClippingL = false
+            var lastPublishedClippingR = false
+            var lastLabelPublishMs = 0L
             while (isActive) {
                 delay(METER_POLL_INTERVAL_MS)
                 // Quantized to METER_DB_STEP before publishing — real-device finding
@@ -920,14 +930,53 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
                 if (peakR > CLIPPING_THRESHOLD_DB) lastClippingDetectedMsR = nowMs
                 val clippingHeldL = (nowMs - lastClippingDetectedMsL) < clippingHoldDurationMs
                 val clippingHeldR = (nowMs - lastClippingDetectedMsR) < clippingHoldDurationMs
-                _meterState.update {
-                    it.copy(
-                        peakDbL = peakL, peakDbR = peakR, rmsDbL = rmsL, rmsDbR = rmsR,
-                        isClippingHeldL = clippingHeldL, isClippingHeldR = clippingHeldR,
-                    )
+
+                // Still-residual-redraw finding (PERF_REINVESTIGATION_2026-07-17.md §1):
+                // 0.5dB quantization alone still publishes ~20Hz in a real (non-silent)
+                // room, because ambient noise routinely crosses a 0.5dB step — but
+                // AudioMeterBar's segmented bar only has 24 segments across the 60dB range
+                // (2.5dB/segment: DB_FLOOR/DB_CEIL/SEGMENT_COUNT in AudioMeterBar.kt), so
+                // ~80% of those publishes moved the numeric dBFS label only, not a single
+                // bar pixel. Gate on *segment* boundary crossings (real visual bar change)
+                // or a clipping-state flip (must be immediate), and otherwise only let the
+                // numeric label refresh at LABEL_PUBLISH_INTERVAL_MS — still fast enough to
+                // read live, but no longer redrawing on every sub-segment dB wobble.
+                val segRmsL = meterSegmentIndex(rmsL)
+                val segRmsR = meterSegmentIndex(rmsR)
+                val segPeakL = meterSegmentIndex(peakL)
+                val segPeakR = meterSegmentIndex(peakR)
+                val segmentChanged = segRmsL != lastPublishedSegRmsL || segRmsR != lastPublishedSegRmsR ||
+                    segPeakL != lastPublishedSegPeakL || segPeakR != lastPublishedSegPeakR
+                val clippingChanged = clippingHeldL != lastPublishedClippingL || clippingHeldR != lastPublishedClippingR
+                val labelDue = nowMs - lastLabelPublishMs >= LABEL_PUBLISH_INTERVAL_MS
+
+                if (segmentChanged || clippingChanged || labelDue) {
+                    _meterState.update {
+                        it.copy(
+                            peakDbL = peakL, peakDbR = peakR, rmsDbL = rmsL, rmsDbR = rmsR,
+                            isClippingHeldL = clippingHeldL, isClippingHeldR = clippingHeldR,
+                        )
+                    }
+                    lastPublishedSegRmsL = segRmsL
+                    lastPublishedSegRmsR = segRmsR
+                    lastPublishedSegPeakL = segPeakL
+                    lastPublishedSegPeakR = segPeakR
+                    lastPublishedClippingL = clippingHeldL
+                    lastPublishedClippingR = clippingHeldR
+                    lastLabelPublishMs = nowMs
                 }
             }
         }
+    }
+
+    /** Segment index (0-based) a given dBFS value falls into on [AudioMeterBar]'s
+     * 24-segment, -60..0dBFS scale — duplicated here (rather than importing from the UI
+     * layer) since it's only used as a *publish gate*, not for rendering; must be kept in
+     * sync with AudioMeterBar.kt's DB_FLOOR/DB_CEIL/SEGMENT_COUNT if that scale ever
+     * changes. See [startMeterPolling]'s `segmentChanged` doc. */
+    private fun meterSegmentIndex(db: Float): Int {
+        val clamped = db.coerceIn(METER_SEGMENT_DB_FLOOR, METER_SEGMENT_DB_CEIL)
+        return ((clamped - METER_SEGMENT_DB_FLOOR) / METER_SEGMENT_WIDTH_DB).toInt()
     }
 
     private fun quantizeDb(db: Float): Float = Math.round(db / METER_DB_STEP) * METER_DB_STEP
@@ -1088,6 +1137,18 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         /** See [quantizeDb]'s call site doc — the dB step below which two meter readings
          * are treated as "the same" for StateFlow emission purposes. */
         const val METER_DB_STEP = 0.5f
+
+        /** See [meterSegmentIndex]'s doc — must match AudioMeterBar.kt's DB_FLOOR/DB_CEIL/
+         * SEGMENT_COUNT (currently -60f/0f/24, i.e. 2.5dB per segment). */
+        const val METER_SEGMENT_DB_FLOOR = -60f
+        const val METER_SEGMENT_DB_CEIL = 0f
+        const val METER_SEGMENT_WIDTH_DB = 2.5f
+
+        /** See [startMeterPolling]'s `labelDue` doc — how often the numeric dBFS label is
+         * allowed to refresh when nothing has crossed a bar segment boundary. ~5Hz is still
+         * comfortably readable as a live number without redrawing on every sub-segment
+         * ambient-noise wobble. */
+        const val LABEL_PUBLISH_INTERVAL_MS = 200L
 
         /** See [histogramL1Distance]'s call site doc. Each of [LuminanceHistogramReader]'s
          * [com.aucampro.recorder.camera.LuminanceHistogramReader.HISTOGRAM_BIN_COUNT] bins

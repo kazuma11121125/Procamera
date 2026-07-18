@@ -1371,6 +1371,15 @@ class RecordingPipeline(private val context: Context) {
         // Must match app/src/main/cpp/engine/OboeFullDuplexEngine.h's kSampleRate/kChannelCount.
         const val AUDIO_SAMPLE_RATE_HZ = 48_000
         const val AUDIO_CHANNEL_COUNT = 2
-        const val AUDIO_BITRATE_BPS = 256_000 // §4: "AAC-LC 48kHz Stereo 256kbps"
+        // §4 originally specified 256kbps; raised to this device's actual AAC-LC encoder
+        // ceiling — real-device query (SO-51C, `c2.android.aac.encoder`, the software AAC
+        // encoder Android selects for this MIME/profile) via
+        // `MediaCodecInfo.getCapabilitiesForType(MIMETYPE_AUDIO_AAC).audioCapabilities
+        // .bitrateRange` returned [8000, 510000] — this is that range's ceiling. Other
+        // devices/encoders may report a different range; `AudioEncoder.codec.configure()`
+        // would throw if this exceeds whatever encoder gets selected there, so if this
+        // constant is ever raised further it must be re-verified the same way rather than
+        // guessed.
+        const val AUDIO_BITRATE_BPS = 510_000
     }
 }

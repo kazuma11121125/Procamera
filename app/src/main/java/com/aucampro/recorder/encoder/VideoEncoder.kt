@@ -51,7 +51,7 @@ class VideoEncoder(
     // MediaCodec.BufferInfo per frame (~60/frame/sec at 60fps recording) — real-device
     // finding: MediaCodec's async callbacks are delivered serially on one internal thread,
     // so reuse is safe as long as no callee retains the reference past the synchronous
-    // onEncodedFrame() call. SegmentedMuxerController.onVideoSample's own doc already
+    // onEncodedFrame() call. MuxerController.onVideoSample's own doc already
     // documents that exact contract (its pending-queue path deep-copies BufferInfo
     // precisely because it's only valid until "the caller's next callback iteration") — so
     // this reuse doesn't change any existing safety assumption, just stops paying for a

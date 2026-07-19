@@ -80,7 +80,8 @@
 ## 3. 音声機能
 
 ネイティブのOboeフルデュプレックスエンジン(C++20、JNI経由)で、**48000Hz・ステレオ(2ch)**、
-約10秒分のリングバッファ容量(`サンプルレート × 10`フレーム)で駆動する。
+最大192kHz時に約21.8秒分となるリングバッファ容量（`192000 × 20` framesを
+次の2冪へ切り上げ）で駆動する。
 
 ### DSPチェーン(固定順序)
 入力ゲイン → ハイパスフィルター → 3バンドEQ → メイクアップゲイン → セーフティリミッター → Peak/RMSメーター
@@ -109,17 +110,16 @@
 
 ## 4. 録画パイプライン
 
-- **セグメント分割録画**: デフォルト**5分**。1/5/10/15/30分の選択肢とAPI
-  (`setSegmentDurationMinutes`)はコード上に存在するが、**現状Settings画面にUIが未接続**で、
-  実質全ユーザーが5分固定。
+- **単一ファイル録画**: 時間によるセグメント分割は行わない。1回の録画につきMP4を1本生成し、
+  ハイレゾ録音時は同じtake名のWAVサイドカーを1本追加する。
 - **保存先**(`StorageLocation`):
   - `AppPrivate` — アプリ専用領域(`getExternalFilesDir("recordings")`)。ギャラリー非表示、
     アンインストールで消える。
   - `PublicMovies` — MediaStore経由で`Movies/AuCamPRO`に保存、ギャラリー表示。**デフォルト**。
   - `Custom` — SAFディレクトリURI。データモデル・永続化層には存在するが、
     **UI上のピッカーが未実装のため現状ユーザーからは到達不可**。
-- **ファイル命名規則**: `AuCamPRO_<takeTimestampMs>_segment_<index>.mp4`
-  (1回の撮影(take)内の全セグメントで同じタイムスタンプを共有)。
+- **ファイル命名規則**: `AuCamPRO_<takeTimestamp>.mp4`、ハイレゾWAVは
+  `AuCamPRO_<takeTimestamp>.wav`。
   写真: `AuCamPRO_IMG_<timestampMs>.jpg`。公開エクスポート先は`Movies/AuCamPRO` /
   `Pictures/AuCamPRO`。
 - **PTS/クロックドメイン**: 映像・音声とも`recordingStartNanos`を0とする共有エポック
@@ -159,14 +159,14 @@
   - 左上: ステレオオーディオメーター(L/Rバー)
   - 中央: 水準器
   - 左下: ヒストグラム + ギャラリーサムネイルボタン
-  - 上中央: ステータスオーバーレイ(REC表示/経過時間/セグメント番号/設定歯車、
+  - 上中央: ステータスオーバーレイ(REC表示/経過時間/設定歯車、
     `showControls`でタップ表示切替可能)
   - 下中央: 常時表示のREC状態テキスト(「STANDBY」/経過時間)+ シャッター行
     (写真モードでは撮影ボタン、動画モードではREC操作はハードウェアキー専用のため何も表示しない)
 - **設定ボトムシート**(`SettingsBottomSheet.kt`、スクロール可能): 解像度/fpsのラジオリスト、
   保存先ラジオリスト(現状AppPrivate/PublicMoviesのみ — 上記のギャップ参照)、
   フレームラインガイドのラジオリスト、マイク入力の優先設定のラジオリスト。
-  セグメント長・カスタム保存先のUIは現状なし。
+  カスタム保存先のUIは現状なし。
 - **CAMERAタブ**(表示順): レンズピル、ZOOM、FPS(表示のみ)、ISO、SHUTTER + フリッカー
   プリセット4種、AF/MFスイッチ、FOCUSスライダー、WBスイッチ、WB(Kelvin)スライダー + プリセット4種。
 - **AUDIOタブ**(表示順): 入力デバイス表示 + xrun/overrun統計、GAINスライダー、
@@ -191,9 +191,8 @@
 - カメラ: Camera2 API(`CameraSessionController`, `ManualCaptureRequestFactory`,
   `CameraCapabilityInspector`, `CaptureRangeClamper`, `FocusController`,
   `TapToFocusStateMachine`/`TapToMeteringRegion`)。
-- エンコード: `MediaCodec`(`VideoEncoder`/`AudioEncoder`)、`SegmentedMuxerController`
-  (`MediaMuxer`をラップし経過時間でセグメント分割)、`PtsClockDomain`、
-  `SegmentRotationPlanner`、`MuxerSampleRouter`、`PcmDither`
+- エンコード: `MediaCodec`(`VideoEncoder`/`AudioEncoder`)、`MuxerController`
+  (`MediaMuxer`をラップし1 takeを1 MP4へ出力)、`PtsClockDomain`、`PcmDither`
   (Float32→16bitのTPDFディザ。MediaCodecの多くのAACエンコーダはPCM_16BIT入力前提のため)。
 - ネイティブオーディオ: C++20、Google Oboe 1.10.0によるフルデュプレックスエンジン
   (`OboeFullDuplexEngine`)。JNI(`NativeEngineBridge`, `System.loadLibrary("aucampro_native")`)
@@ -230,13 +229,10 @@
 
 ## 8. 既知の制限事項・未実装ギャップ
 
-- **セグメント長**: UIから変更できるのは実質5分のみ。1/5/10/15/30分の選択肢とセッターは
-  コード上に存在するが、Settings画面に未接続。
 - **カスタム保存先(SAF)**: `StorageLocation`型と永続化層には存在するが、UIピッカー未実装で
   ユーザーからは到達不可。
-- **セグメント境界をまたぐ長時間録画の連続性**: `docs/ARCHITECTURE.md`の判断ログで、
-  ヒューリスティックな境界処理以上の検証(実機での複数セグメントにまたがる長時間録画)は
-  未実施と明記されている(今回の実機検証も短時間・単一セグメントの撮影のみ)。
+- **単一ファイル録画のクラッシュ耐性**: 正常停止またはJVM例外時のbest-effort finalizeでは
+  MP4/WAVを確定するが、強制kill・電源断・ネイティブクラッシュではtake全体が失われ得る。
 - **on-device ASan/UBSan用のwrap.sh**: 未整備。デバッグビルドではASanランタイムの`.so`が
   `dlopen`できないため`AUCAMPRO_ENABLE_SANITIZERS=OFF`で強制無効化中(本日
   `PROCAMERA_ENABLE_SANITIZERS`からリネーム)。ホストGTestビルドはサニタイザー有効のまま影響なし。
@@ -250,7 +246,7 @@
 - **CI/GitHub Actions**: 「Phase5」で計画されていたが、`.github/workflows/`はリポジトリに未作成。
 - **マニュアルWB**: `MANUAL_POST_PROCESSING` + `AWB_MODE_OFF`非対応機種(LIMITEDレベル等)では
   機能自体を無効化し、非対応メッセージを表示する。
-- 2026-07-16時点で、録画パイプライン・セグメントファイル命名・`PublicMovies`への
-  MediaStoreエクスポート(命名衝突修正込み)は実機(SO-51C)で問題なく動作することを確認済み。
+- 2026-07-19の単一ファイル化はホスト単体テストとdebug APKビルドまで確認済み。
+  `PublicMovies`へのMediaStoreエクスポートを含む実機確認は未実施。
   また、初回起動時の保存先デフォルトが`AppPrivate`に誤ってフォールバックしていた不具合も
   同日中に修正し、`PublicMovies`が正しくデフォルトになることを実機で確認済み。

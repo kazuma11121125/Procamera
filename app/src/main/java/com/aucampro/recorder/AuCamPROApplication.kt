@@ -12,7 +12,7 @@ import com.aucampro.recorder.pipeline.RecordingPipeline
  *
  * Also installs a process-wide [Thread.UncaughtExceptionHandler] (§4.6 crash safety) that
  * makes a best-effort attempt to finalize the currently-open recording segment (see
- * [RecordingPipeline.emergencyFinalizeCurrentSegment]'s doc for exactly what this does and
+ * [RecordingPipeline.emergencyFinalizeRecording]'s doc for exactly what this does and
  * doesn't cover) before re-throwing to the platform's default handler — the crash still
  * happens and is still reported normally, this only tries to save the in-progress
  * segment first.
@@ -25,7 +25,7 @@ class AuCamPROApplication : Application() {
     /**
      * Set by [com.aucampro.recorder.ui.viewmodel.CameraControlViewModel] to the single
      * [RecordingPipeline] instance it owns, so the crash handler below can reach it
-     * without a DI graph. `emergencyFinalizeCurrentSegment()` is already a no-op when
+     * without a DI graph. `emergencyFinalizeRecording()` is already a no-op when
      * nothing is being recorded, so this is left set for the ViewModel's whole lifetime
      * rather than cleared between recordings.
      */
@@ -42,7 +42,7 @@ class AuCamPROApplication : Application() {
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             try {
                 Log.e(TAG, "Uncaught exception — attempting emergency muxer finalize", throwable)
-                activeRecordingPipeline?.emergencyFinalizeCurrentSegment()
+                activeRecordingPipeline?.emergencyFinalizeRecording()
             } catch (e: Throwable) {
                 Log.e(TAG, "Crash handler itself failed", e)
             } finally {

@@ -12,7 +12,7 @@ OboeFullDuplexEngine::OboeFullDuplexEngine()
       eq_(kStandardSampleRate, kChannelCount),
       limiter_(-1.0f),
       meter_(kStandardSampleRate),
-      ringBuffer_(kRingBufferCapacityFrames * kChannelCount) {}
+      ringBuffer_(kRingBufferCapacityFrames) {}
 
 OboeFullDuplexEngine::~OboeFullDuplexEngine() { stop(); }
 
@@ -159,11 +159,10 @@ Result<void, std::string> OboeFullDuplexEngine::start(int32_t preferredInputDevi
         inputStream_.reset();
     }
     if (outputStream_) {
-        outputStreamRaw_.store(nullptr, std::memory_order_release);
+        monitorOutputPath_.setEnabled(false);
         outputStream_->requestStop();
         outputStream_->close();
         outputStream_.reset();
-        monitoringEnabled_.store(false, std::memory_order_relaxed);
     }
 
     // Rate fallback ladder (docs/HIRES_AUDIO_DESIGN.md §3): descend from
@@ -212,12 +211,8 @@ Result<void, std::string> OboeFullDuplexEngine::start(int32_t preferredInputDevi
 
 void OboeFullDuplexEngine::stop() {
     std::lock_guard<std::mutex> lock(streamMutex_);
-    monitoringEnabled_.store(false, std::memory_order_relaxed);
+    monitorOutputPath_.setEnabled(false);
 
-    // Input stream MUST close first: Oboe guarantees onAudioReady() cannot fire again
-    // once close() returns, which is what makes it safe to then close the output stream
-    // below without racing the passthrough write() a still-running callback might
-    // otherwise be issuing concurrently.
     if (inputStream_) {
         inputStream_->requestStop();
         inputStream_->close();
@@ -225,10 +220,6 @@ void OboeFullDuplexEngine::stop() {
     }
 
     if (outputStream_) {
-        // Clear the audio-thread-visible pointer before actually closing — by this point
-        // onAudioReady() can no longer be invoked at all (input stream already closed
-        // above), so this ordering is a defensive belt-and-suspenders, not load-bearing.
-        outputStreamRaw_.store(nullptr, std::memory_order_release);
         outputStream_->requestStop();
         outputStream_->close();
         outputStream_.reset();
@@ -238,11 +229,15 @@ void OboeFullDuplexEngine::stop() {
 Result<void, std::string> OboeFullDuplexEngine::reopenInputStream(int32_t deviceId) {
     std::lock_guard<std::mutex> lock(streamMutex_);
 
+    timespec gapStart{};
+    clock_gettime(CLOCK_MONOTONIC, &gapStart);
+
     if (inputStream_) {
         inputStream_->requestStop();
         inputStream_->close();
         inputStream_.reset();
     }
+    monitorOutputPath_.requestReset();
 
     // Device hot-swap only — keeps the engine's current sampleRateHz_ (set by [start]),
     // never changes rate here. A rate change is a distinct, explicit user action (Settings
@@ -252,6 +247,29 @@ Result<void, std::string> OboeFullDuplexEngine::reopenInputStream(int32_t device
         return Result<void, std::string>::Err(openResult.error());
     }
     inputStream_ = openResult.value();
+
+    // Cover the capture gap before the new callback producer starts. The old Kotlin path
+    // called insertSilence() only after requestStart(), so this nominally-SPSC ring had
+    // two concurrent producers (the new Oboe callback and the caller thread). Producing
+    // the silence here, while the old stream is closed and the new one has not started,
+    // preserves the single-producer invariant.
+    timespec gapEnd{};
+    clock_gettime(CLOCK_MONOTONIC, &gapEnd);
+    const int64_t gapNanos =
+        (static_cast<int64_t>(gapEnd.tv_sec) - static_cast<int64_t>(gapStart.tv_sec)) * 1'000'000'000LL +
+        (static_cast<int64_t>(gapEnd.tv_nsec) - static_cast<int64_t>(gapStart.tv_nsec));
+    const size_t gapFrames = static_cast<size_t>(
+        (gapNanos * static_cast<int64_t>(sampleRateHz_)) / 1'000'000'000LL);
+    if (gapFrames > 0) {
+        std::vector<StereoFrame> silence(gapFrames, StereoFrame{0.0f, 0.0f});
+        const size_t written = ringBuffer_.write(silence.data(), silence.size());
+        if (written < silence.size()) {
+            ringBufferOverrunCount_.fetch_add(1, std::memory_order_relaxed);
+            ringBufferDroppedFrameCount_.fetch_add(
+                static_cast<int64_t>(silence.size() - written), std::memory_order_relaxed);
+        }
+        updateRingBufferHighWater(ringBuffer_.availableToRead());
+    }
 
     const oboe::Result startResult = inputStream_->requestStart();
     if (startResult != oboe::Result::OK) {
@@ -263,34 +281,16 @@ Result<void, std::string> OboeFullDuplexEngine::reopenInputStream(int32_t device
     return Result<void, std::string>::Ok();
 }
 
-void OboeFullDuplexEngine::insertSilence(int32_t frameCount) {
-    if (frameCount <= 0) {
-        return;
-    }
-    // Non-RT context (called from Kotlin's device-reconnect orchestration), so a
-    // heap-allocated scratch buffer is fine here even though it would not be inside
-    // onAudioReady().
-    std::vector<float> silence(static_cast<size_t>(frameCount) * kChannelCount, 0.0f);
-    const size_t written = ringBuffer_.write(silence.data(), silence.size());
-    if (written < silence.size()) {
-        ringBufferOverrunCount_.fetch_add(1, std::memory_order_relaxed);
-    }
-}
-
 Result<void, std::string> OboeFullDuplexEngine::setMonitoringEnabled(bool enabled, int32_t outputDeviceId) {
     std::lock_guard<std::mutex> lock(streamMutex_);
 
     if (!enabled) {
-        // Deliberately does NOT close the output stream — see the header comment on this
-        // method for why (the input callback may still be mid-write() on it).
-        monitoringEnabled_.store(false, std::memory_order_relaxed);
+        monitorOutputPath_.setEnabled(false);
         return Result<void, std::string>::Ok();
     }
 
     if (outputStream_) {
-        // Already open (e.g. re-enabling); nothing further to do. Note: does not support
-        // switching to a different outputDeviceId once open — see header comment.
-        monitoringEnabled_.store(true, std::memory_order_relaxed);
+        monitorOutputPath_.setEnabled(true);
         return Result<void, std::string>::Ok();
     }
 
@@ -301,21 +301,11 @@ Result<void, std::string> OboeFullDuplexEngine::setMonitoringEnabled(bool enable
     // monitor passthrough would play back at roughly 2x speed/pitch.
     oboe::AudioStreamBuilder builder;
     builder.setDirection(oboe::Direction::Output)
-        // 実機で発見 (2026-07-18, monitor-noise investigation): this was LowLatency,
-        // which on this hardware (Sony SO-51C) grants only ~1536 frames of buffer
-        // capacity (getBufferCapacityInFrames(), confirmed via the diagnostic log below)
-        // — smaller than a single *input* callback's payload at hi-res rates. The input
-        // stream is PerformanceMode::None (see openInputStreamLocked's doc: a different
-        // real-device fix, for stereo capture correctness on this same hardware), whose
-        // own framesPerBurst was measured at 3840 frames (20ms) at 192kHz. onAudioReady's
-        // passthrough write()s that entire 3840-frame chunk to the output stream in one
-        // non-blocking call every callback — structurally impossible to fit through a
-        // buffer capped below 3840 frames no matter how setBufferSizeInFrames below is
-        // tuned, which is what was producing the reported continuous "プチプチ/パチパチ"
-        // crackling (confirmed via monitorWriteShortfallCount climbing continuously).
-        // None here grants a much larger capacity (matching the input side's ballpark),
-        // large enough to actually hold a full input callback's worth of frames.
-        ->setPerformanceMode(oboe::PerformanceMode::None)
+        // The output is callback-driven now, so it no longer has to fit an entire
+        // PerformanceMode::None input callback into one non-blocking write. LowLatency
+        // gives the HAL small regular pull blocks while the separate FIFO provides the
+        // deliberate ~40ms jitter/drift reserve.
+        ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
         ->setSharingMode(oboe::SharingMode::Shared)
         ->setFormat(oboe::AudioFormat::Float)
         ->setSampleRate(sampleRateHz_)
@@ -324,12 +314,11 @@ Result<void, std::string> OboeFullDuplexEngine::setMonitoringEnabled(bool enable
         ->setFormatConversionAllowed(true)
         ->setChannelConversionAllowed(true)
         ->setSampleRateConversionQuality(oboe::SampleRateConversionQuality::Medium)
+        ->setDataCallback(this)
         // Diagnostic only (2026-07-18, monitor OFF→ON silence investigation) — unlike
         // the input stream, onErrorAfterClose() doesn't attempt any live recovery for
-        // this direction (there is no safe way to close/reopen just the output stream
-        // while the input callback keeps running, see this class's header doc on
-        // outputStream_/outputStreamRaw_). This just makes a genuine real-device
-        // disconnect of the monitor output visible in logcat instead of silent.
+        // this direction yet. This makes a genuine real-device disconnect of the
+        // monitor output visible in logcat instead of silent.
         ->setErrorCallback(this);
     if (outputDeviceId != oboe::kUnspecified) {
         builder.setDeviceId(outputDeviceId);
@@ -361,21 +350,9 @@ Result<void, std::string> OboeFullDuplexEngine::setMonitoringEnabled(bool enable
             "Monitor output stream channel/sample-rate did not match the input engine's current rate");
     }
 
-    // 実機で発見 (2026-07-18, monitor-noise investigation): this stream is fed via
-    // explicit write() calls from the *input* stream's own audio callback (a foreign
-    // thread relative to this stream's own playback thread) — one write() per input
-    // callback, carrying that entire callback's numFrames. At hi-res rates the input
-    // side (PerformanceMode::None, see openInputStreamLocked's doc) delivers ~20ms/
-    // callback; measured on-device at 192kHz that's 3840 frames. The buffer must be
-    // able to hold at least that much or every single write() structurally can't fit
-    // (confirmed: this was the actual cause of the continuous shortfalls/crackling, not
-    // just needing a jitter margin — see the PerformanceMode::None switch above this
-    // stream's own builder). Sized to ~3 input-callback-periods (~60ms) for headroom
-    // beyond the bare minimum; clamped to whatever this stream's own
-    // getBufferCapacityInFrames() actually grants.
-    const int32_t inputFramesPerCallback = inputStream_ ? inputStream_->getFramesPerBurst() : 0;
-    const int32_t targetBufferFrames = inputFramesPerCallback > 0 ? inputFramesPerCallback * 3
-                                                                    : stream->getFramesPerBurst() * 4;
+    const int32_t inputFramesPerCallback =
+        inputStream_ ? inputStream_->getFramesPerBurst() : 0;
+    const int32_t targetBufferFrames = stream->getFramesPerBurst() * 2;
     if (targetBufferFrames > 0) {
         const auto setBufferResult = stream->setBufferSizeInFrames(targetBufferFrames);
         if (!setBufferResult) {
@@ -384,8 +361,11 @@ Result<void, std::string> OboeFullDuplexEngine::setMonitoringEnabled(bool enable
         }
     }
 
+    monitorOutputPath_.configure(sampleRateHz_, inputFramesPerCallback,
+                                 stream->getFramesPerBurst());
     const oboe::Result startResult = stream->requestStart();
     if (startResult != oboe::Result::OK) {
+        monitorOutputPath_.setEnabled(false);
         stream->close();
         return Result<void, std::string>::Err(std::string("monitor output requestStart failed: ") +
                                                 oboe::convertToText(startResult));
@@ -410,11 +390,10 @@ Result<void, std::string> OboeFullDuplexEngine::setMonitoringEnabled(bool enable
                     inputStream_ ? inputStream_->getBufferCapacityInFrames() : -1);
 
     outputStream_ = stream;
-    // Published last, after the shared_ptr member and the stream is fully started, so
-    // the audio thread never observes a non-null raw pointer to a stream that isn't
-    // ready to accept write() calls yet.
-    outputStreamRaw_.store(stream.get(), std::memory_order_release);
-    monitoringEnabled_.store(true, std::memory_order_relaxed);
+    // Enable production only after the output callback is actually running. Enabling
+    // before requestStart() lets the 3840-frame input callback fill the monitor FIFO
+    // while the blocking start handshake is still in progress.
+    monitorOutputPath_.setEnabled(true);
     return Result<void, std::string>::Ok();
 }
 
@@ -423,6 +402,10 @@ void OboeFullDuplexEngine::setEqBandParams(int band, float freqHz, float q, floa
 }
 
 int32_t OboeFullDuplexEngine::hardwareXRunCount() const {
+    // §9: inputStream_ is reassigned under streamMutex_ by start()/stop()/
+    // reopenInputStream() (e.g. on device hot-swap), so reading it without the same lock
+    // is a real shared_ptr data race, not just a stale-value risk.
+    std::lock_guard<std::mutex> lock(streamMutex_);
     if (!inputStream_) {
         return 0;
     }
@@ -430,7 +413,19 @@ int32_t OboeFullDuplexEngine::hardwareXRunCount() const {
     return result ? result.value() : 0;
 }
 
+int32_t OboeFullDuplexEngine::monitorOutputXRunCount() const {
+    if (!outputStream_) {
+        return 0;
+    }
+    const oboe::ResultWithValue<int32_t> result = outputStream_->getXRunCount();
+    return result ? result.value() : 0;
+}
+
 bool OboeFullDuplexEngine::getInputTimestamp(int64_t *outFramePosition, int64_t *outTimeNanos) const {
+    // §9: same race as hardwareXRunCount() above — this also feeds AudioEncoder's PTS
+    // anchor (seedAudioAnchor()), so an unsynchronized read here could in theory corrupt
+    // recorded-audio timing, not just report a stale diagnostic.
+    std::lock_guard<std::mutex> lock(streamMutex_);
     if (!inputStream_) {
         return false;
     }
@@ -444,15 +439,37 @@ bool OboeFullDuplexEngine::getInputTimestamp(int64_t *outFramePosition, int64_t 
 }
 
 size_t OboeFullDuplexEngine::drainEncoderBuffer(float *dst, size_t maxFrames) {
-    return ringBuffer_.read(dst, maxFrames * kChannelCount) / kChannelCount;
+    auto *frames = reinterpret_cast<StereoFrame *>(dst);
+    return ringBuffer_.read(frames, maxFrames);
 }
 
-void OboeFullDuplexEngine::flushRingBuffer() { ringBuffer_.clear(); }
+void OboeFullDuplexEngine::flushRingBuffer() {
+    ringBuffer_.clear();
+    ringBufferOverrunCount_.store(0, std::memory_order_relaxed);
+    ringBufferDroppedFrameCount_.store(0, std::memory_order_relaxed);
+    ringBufferHighWaterFrames_.store(0, std::memory_order_relaxed);
+}
 
-oboe::DataCallbackResult OboeFullDuplexEngine::onAudioReady(oboe::AudioStream * /*stream*/, void *audioData,
+void OboeFullDuplexEngine::updateRingBufferHighWater(size_t fillFrames) {
+    const int32_t fill = static_cast<int32_t>(fillFrames);
+    int32_t previous = ringBufferHighWaterFrames_.load(std::memory_order_relaxed);
+    while (fill > previous &&
+           !ringBufferHighWaterFrames_.compare_exchange_weak(
+               previous, fill, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
+oboe::DataCallbackResult OboeFullDuplexEngine::onAudioReady(oboe::AudioStream *stream, void *audioData,
                                                               int32_t numFrames) {
+    if (stream->getDirection() == oboe::Direction::Output) {
+        monitorOutputPath_.render(static_cast<StereoFrame *>(audioData),
+                                  static_cast<size_t>(numFrames));
+        return oboe::DataCallbackResult::Continue;
+    }
+
     auto *samples = static_cast<float *>(audioData);
-    const size_t sampleCount = static_cast<size_t>(numFrames) * kChannelCount;
+    const size_t frameCount = static_cast<size_t>(numFrames);
+    const size_t sampleCount = frameCount * kChannelCount;
 
     inputGain_.process(samples, sampleCount);
     highPassFilter_.process(samples, static_cast<size_t>(numFrames));
@@ -461,67 +478,30 @@ oboe::DataCallbackResult OboeFullDuplexEngine::onAudioReady(oboe::AudioStream * 
     limiter_.process(samples, sampleCount);
     meter_.process(samples, static_cast<size_t>(numFrames), kChannelCount);
 
-    const size_t written = ringBuffer_.write(samples, sampleCount);
-    if (written < sampleCount) {
+    const auto *frames = reinterpret_cast<const StereoFrame *>(samples);
+    const size_t writtenFrames = ringBuffer_.writeAllOrNothing(frames, frameCount);
+    if (writtenFrames != frameCount) {
         // Encoder thread is falling behind the mic; this is the same kind of
         // backpressure condition §4.4 asks us to surface for the Muxer queue, applied
-        // here to the audio ring buffer. RT-safe: only an atomic increment.
+        // here to the audio ring buffer. Drop the complete callback rather than a scalar
+        // prefix: splitting a stereo frame would shift L/R alignment and turn a single
+        // overrun into persistent garbled noise. RT-safe: atomics only.
         ringBufferOverrunCount_.fetch_add(1, std::memory_order_relaxed);
+        ringBufferDroppedFrameCount_.fetch_add(
+            static_cast<int64_t>(frameCount), std::memory_order_relaxed);
+    } else {
+        updateRingBufferHighWater(ringBuffer_.availableToRead());
     }
-
-    oboe::AudioStream *output = outputStreamRaw_.load(std::memory_order_acquire);
-    if (output != nullptr) {
-        if (monitoringEnabled_.load(std::memory_order_relaxed)) {
-            // timeoutNanoseconds=0: never blocks, per §4.2's prohibition on blocking I/O
-            // in the audio callback. A short write is simply dropped (monitoring is
-            // best-effort; it must never be allowed to threaten the input callback's
-            // deadline or the encoder ring buffer's integrity).
-            //
-            // Diagnostic (2026-07-18, monitor-noise investigation) — kept permanently, same as ringBufferOverrunCount/hardwareXRunCount: count it
-            // when that drop actually happens, so a real-device test session can
-            // correlate audible noise with genuine dropped-frame events here rather
-            // than guessing. RT-safe: only an atomic increment on top of the write()
-            // this branch already made unconditionally before this diagnostic existed.
-            const oboe::ResultWithValue<int32_t> writeResult = output->write(samples, numFrames, 0);
-            if (!writeResult || writeResult.value() < numFrames) {
-                monitorWriteShortfallCount_.fetch_add(1, std::memory_order_relaxed);
-            }
-        } else {
-            // 実機未検証（推定）(2026-07-18, monitor OFF→ON silence investigation): this
-            // used to skip writing to the output stream entirely while monitoring is
-            // off, since setMonitoringEnabled(false) deliberately leaves the stream
-            // open/started rather than closing it (see that method's doc). Hypothesis
-            // (not yet confirmed via on-device logcat): a LowLatency+Shared AAudio
-            // output stream that is `started()` but never fed any data risks the HAL
-            // treating it as underrun/stalled and tearing it down internally, at which
-            // point setMonitoringEnabled(true)'s "already open" fast path would reuse a
-            // dead stream — UI reports ON, nothing is audible. The exact mechanism is
-            // unverified, but this fix is mechanism-agnostic: continuously feeding
-            // silence (bounded stack buffer, no allocation, RT-safe) prevents the
-            // unfed gap regardless of which underrun/teardown path would have caused
-            // it. If setErrorCallback below still logs a real disconnect after this,
-            // the mechanism was something this doesn't cover and needs live recovery,
-            // not just avoidance.
-            constexpr int32_t kSilenceChunkFrames = 256;
-            float silence[kSilenceChunkFrames * kChannelCount] = {0.0f};
-            int32_t remaining = numFrames;
-            while (remaining > 0) {
-                const int32_t chunk = remaining < kSilenceChunkFrames ? remaining : kSilenceChunkFrames;
-                output->write(silence, chunk, 0);
-                remaining -= chunk;
-            }
-        }
-    }
+    monitorOutputPath_.push(frames, frameCount);
 
     return oboe::DataCallbackResult::Continue;
 }
 
 void OboeFullDuplexEngine::onErrorAfterClose(oboe::AudioStream *stream, oboe::Result error) {
     // Runs on an Oboe-internal thread, not the audio callback thread itself, but still
-    // treated as non-blocking/log-only here; the actual "insert silence and reopen on a
-    // new device" orchestration happens in Kotlin's AudioDeviceRouter (§4.2), which
-    // observes the disconnect via AudioManager.registerAudioDeviceCallback and drives
-    // reopenInputStream()/insertSilence() from a normal coroutine context.
+    // treated as non-blocking/log-only here; Kotlin's AudioDeviceRouter (§4.2) requests
+    // the reopen from a normal coroutine context. reopenInputStream() measures and fills
+    // the gap before the replacement callback starts, preserving the SPSC ring contract.
     AUCAMPRO_LOGW("Stream closed after error: %s (direction=%d)", oboe::convertToText(error),
                     static_cast<int>(stream->getDirection()));
 }

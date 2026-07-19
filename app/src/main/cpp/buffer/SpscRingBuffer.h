@@ -77,6 +77,33 @@ public:
         return toWrite;
     }
 
+    // Producer-only. Writes the complete batch or nothing. Audio producers use this
+    // variant for one callback's interleaved frames: accepting only a prefix would create
+    // an audible discontinuity, and when T is a scalar sample it can even split a
+    // multi-channel frame. Keeping this primitive generic also makes the invariant easy
+    // to exercise in the host tests.
+    size_t writeAllOrNothing(const T *src, size_t count) {
+        const size_t writeIdx = writeIndex_.load(std::memory_order_relaxed);
+        const size_t readIdx = readIndex_.load(std::memory_order_acquire);
+        const size_t freeSpace = capacity_ - (writeIdx - readIdx);
+        if (count > freeSpace) {
+            return 0;
+        }
+        if (count == 0) {
+            return 0;
+        }
+
+        const size_t writePos = writeIdx & mask_;
+        const size_t firstChunk = count < (capacity_ - writePos) ? count : (capacity_ - writePos);
+        std::memcpy(&buffer_[writePos], src, firstChunk * sizeof(T));
+        if (count > firstChunk) {
+            std::memcpy(&buffer_[0], src + firstChunk, (count - firstChunk) * sizeof(T));
+        }
+
+        writeIndex_.store(writeIdx + count, std::memory_order_release);
+        return count;
+    }
+
     // Consumer-only (Audio Encoder thread). Returns the number of elements actually read.
     size_t read(T *dst, size_t count) {
         const size_t readIdx = readIndex_.load(std::memory_order_relaxed);
@@ -96,6 +123,41 @@ public:
 
         readIndex_.store(readIdx + toRead, std::memory_order_release);
         return toRead;
+    }
+
+    // Consumer-only. Copies up to [count] elements without advancing the read cursor.
+    // This is useful for interpolation/resampling, where the consumer needs a small
+    // look-ahead window and only knows how many source frames to consume after producing
+    // the destination block.
+    size_t peek(T *dst, size_t count) const {
+        const size_t readIdx = readIndex_.load(std::memory_order_relaxed);
+        const size_t writeIdx = writeIndex_.load(std::memory_order_acquire);
+        const size_t available = writeIdx - readIdx;
+        const size_t toCopy = count < available ? count : available;
+        if (toCopy == 0) {
+            return 0;
+        }
+
+        const size_t readPos = readIdx & mask_;
+        const size_t firstChunk = toCopy < (capacity_ - readPos) ? toCopy : (capacity_ - readPos);
+        std::memcpy(dst, &buffer_[readPos], firstChunk * sizeof(T));
+        if (toCopy > firstChunk) {
+            std::memcpy(dst + firstChunk, &buffer_[0], (toCopy - firstChunk) * sizeof(T));
+        }
+        return toCopy;
+    }
+
+    // Consumer-only. Advances the read cursor without copying. Returns the number of
+    // elements discarded, clamped to the amount currently published by the producer.
+    size_t discard(size_t count) {
+        const size_t readIdx = readIndex_.load(std::memory_order_relaxed);
+        const size_t writeIdx = writeIndex_.load(std::memory_order_acquire);
+        const size_t available = writeIdx - readIdx;
+        const size_t toDiscard = count < available ? count : available;
+        if (toDiscard != 0) {
+            readIndex_.store(readIdx + toDiscard, std::memory_order_release);
+        }
+        return toDiscard;
     }
 
     // Approximate — only exact if called from the producer thread itself (readIndex_ can

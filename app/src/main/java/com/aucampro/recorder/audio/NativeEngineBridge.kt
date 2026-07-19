@@ -44,8 +44,6 @@ class NativeEngineBridge : AutoCloseable {
 
     fun reopenInputStream(deviceId: Int): String? = nativeReopenInputStream(handle, deviceId)
 
-    fun insertSilence(frameCount: Int) = nativeInsertSilence(handle, frameCount)
-
     fun setMonitoringEnabled(enabled: Boolean, outputDeviceId: Int = kUnspecifiedDeviceId): String? =
         nativeSetMonitoringEnabled(handle, enabled, outputDeviceId)
 
@@ -76,11 +74,31 @@ class NativeEngineBridge : AutoCloseable {
 
     fun ringBufferOverrunCount(): Int = if (closed) 0 else nativeRingBufferOverrunCount(handle)
 
+    fun ringBufferDroppedFrameCount(): Long =
+        if (closed) 0L else nativeRingBufferDroppedFrameCount(handle)
+
+    fun ringBufferFillFrames(): Int = if (closed) 0 else nativeRingBufferFillFrames(handle)
+
+    fun ringBufferHighWaterFrames(): Int =
+        if (closed) 0 else nativeRingBufferHighWaterFrames(handle)
+
     fun hardwareXRunCount(): Int = if (closed) 0 else nativeHardwareXRunCount(handle)
 
-    /** Diagnostic (2026-07-18, monitor-noise investigation) — kept permanently, same as ringBufferOverrunCount/hardwareXRunCount — see
-     * `OboeFullDuplexEngine::monitorWriteShortfallCount`'s doc. */
-    fun monitorWriteShortfallCount(): Int = if (closed) 0 else nativeMonitorWriteShortfallCount(handle)
+    fun monitorBufferFillFrames(): Int = if (closed) 0 else nativeMonitorBufferFillFrames(handle)
+    fun monitorBufferTargetFrames(): Int = if (closed) 0 else nativeMonitorBufferTargetFrames(handle)
+    fun monitorCorrectionPpm(): Int = if (closed) 0 else nativeMonitorCorrectionPpm(handle)
+    fun monitorUnderflowCount(): Int = if (closed) 0 else nativeMonitorUnderflowCount(handle)
+    fun monitorUnderflowFrameCount(): Long =
+        if (closed) 0L else nativeMonitorUnderflowFrameCount(handle)
+    fun monitorOverflowCount(): Int = if (closed) 0 else nativeMonitorOverflowCount(handle)
+    fun monitorOverflowDroppedFrameCount(): Long =
+        if (closed) 0L else nativeMonitorOverflowDroppedFrameCount(handle)
+    fun monitorResyncCount(): Int = if (closed) 0 else nativeMonitorResyncCount(handle)
+    fun monitorInputCallbackFrameCount(): Long =
+        if (closed) 0L else nativeMonitorInputCallbackFrameCount(handle)
+    fun monitorOutputCallbackFrameCount(): Long =
+        if (closed) 0L else nativeMonitorOutputCallbackFrameCount(handle)
+    fun monitorOutputXRunCount(): Int = if (closed) 0 else nativeMonitorOutputXRunCount(handle)
 
     /**
      * One-shot (framePosition, timeNanos) correlation at CLOCK_MONOTONIC, used to seed
@@ -106,6 +124,24 @@ class NativeEngineBridge : AutoCloseable {
      * safe against a freed engine, this is just skipping the now-guaranteed-no-op call. */
     fun drainEncoderBuffer(dst: FloatArray, maxFrames: Int): Int =
         if (closed) 0 else nativeDrainEncoderBuffer(handle, dst, maxFrames)
+
+    /** Resets the per-take native hi-res decimator + TPDF dither state. */
+    fun resetEncoderPcmConverter(
+        inputSampleRateHz: Int,
+        outputSampleRateHz: Int,
+        channelCount: Int,
+        randomSeed: Int,
+    ): Boolean = !closed && nativeResetEncoderPcmConverter(
+        handle,
+        inputSampleRateHz,
+        outputSampleRateHz,
+        channelCount,
+        randomSeed,
+    )
+
+    /** Converts raw capture-rate Float32 frames into AAC-rate interleaved Int16 PCM. */
+    fun convertEncoderPcm(input: FloatArray, frameCount: Int, output: ShortArray): Int =
+        if (closed) 0 else nativeConvertEncoderPcm(handle, input, frameCount, output)
 
     /** Discards any stale backlog (see `OboeFullDuplexEngine::flushRingBuffer`'s doc) —
      * call before a fresh [com.aucampro.recorder.encoder.AudioEncoder] starts draining. */
@@ -137,7 +173,6 @@ class NativeEngineBridge : AutoCloseable {
     private external fun nativeGetActualSampleRate(handle: Long): Int
     private external fun nativeStop(handle: Long)
     private external fun nativeReopenInputStream(handle: Long, deviceId: Int): String?
-    private external fun nativeInsertSilence(handle: Long, frameCount: Int)
     private external fun nativeSetMonitoringEnabled(handle: Long, enabled: Boolean, outputDeviceId: Int): String?
     private external fun nativeSetEqBandParams(handle: Long, band: Int, freqHz: Float, q: Float, gainDb: Float)
     private external fun nativeSetInputGainDb(handle: Long, gainDb: Float)
@@ -147,9 +182,35 @@ class NativeEngineBridge : AutoCloseable {
     private external fun nativePeakDb(handle: Long, channel: Int): Float
     private external fun nativeRmsDb(handle: Long, channel: Int): Float
     private external fun nativeRingBufferOverrunCount(handle: Long): Int
+    private external fun nativeRingBufferDroppedFrameCount(handle: Long): Long
+    private external fun nativeRingBufferFillFrames(handle: Long): Int
+    private external fun nativeRingBufferHighWaterFrames(handle: Long): Int
     private external fun nativeHardwareXRunCount(handle: Long): Int
-    private external fun nativeMonitorWriteShortfallCount(handle: Long): Int
+    private external fun nativeMonitorBufferFillFrames(handle: Long): Int
+    private external fun nativeMonitorBufferTargetFrames(handle: Long): Int
+    private external fun nativeMonitorCorrectionPpm(handle: Long): Int
+    private external fun nativeMonitorUnderflowCount(handle: Long): Int
+    private external fun nativeMonitorUnderflowFrameCount(handle: Long): Long
+    private external fun nativeMonitorOverflowCount(handle: Long): Int
+    private external fun nativeMonitorOverflowDroppedFrameCount(handle: Long): Long
+    private external fun nativeMonitorResyncCount(handle: Long): Int
+    private external fun nativeMonitorInputCallbackFrameCount(handle: Long): Long
+    private external fun nativeMonitorOutputCallbackFrameCount(handle: Long): Long
+    private external fun nativeMonitorOutputXRunCount(handle: Long): Int
     private external fun nativeGetInputTimestamp(handle: Long): LongArray?
     private external fun nativeDrainEncoderBuffer(handle: Long, dst: FloatArray, maxFrames: Int): Int
+    private external fun nativeResetEncoderPcmConverter(
+        handle: Long,
+        inputSampleRateHz: Int,
+        outputSampleRateHz: Int,
+        channelCount: Int,
+        randomSeed: Int,
+    ): Boolean
+    private external fun nativeConvertEncoderPcm(
+        handle: Long,
+        input: FloatArray,
+        frameCount: Int,
+        output: ShortArray,
+    ): Int
     private external fun nativeFlushRingBuffer(handle: Long)
 }

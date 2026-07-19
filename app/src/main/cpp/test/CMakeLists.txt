@@ -47,6 +47,8 @@ add_library(aucampro_portable STATIC
     ${AUCAMPRO_CPP_ROOT}/dsp/InputGain.cpp
     ${AUCAMPRO_CPP_ROOT}/dsp/MakeupGain.cpp
     ${AUCAMPRO_CPP_ROOT}/dsp/HighPassFilter.cpp
+    ${AUCAMPRO_CPP_ROOT}/dsp/EncoderPcmConverter.cpp
+    ${AUCAMPRO_CPP_ROOT}/engine/MonitorOutputPath.cpp
 )
 target_include_directories(aucampro_portable PUBLIC ${AUCAMPRO_CPP_ROOT})
 target_compile_options(aucampro_portable PUBLIC -Wall -Wextra)
@@ -67,6 +69,8 @@ add_executable(aucampro_native_tests
     test_safety_limiter.cpp
     test_peak_rms_meter.cpp
     test_input_gain.cpp
+    test_encoder_pcm_converter.cpp
+    test_monitor_output_path.cpp
 )
 target_link_libraries(aucampro_native_tests PRIVATE aucampro_portable GTest::gtest_main)
 

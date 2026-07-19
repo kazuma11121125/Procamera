@@ -1,5 +1,6 @@
 #include <jni.h>
 
+#include <array>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
@@ -129,12 +130,6 @@ JNIEXPORT jstring JNICALL Java_com_aucampro_recorder_audio_NativeEngineBridge_na
     return nullptr;
 }
 
-JNIEXPORT void JNICALL Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeInsertSilence(
-    JNIEnv *, jobject, jlong handle, jint frameCount) {
-    EngineGuard guard(handle);
-    if (guard.get() != nullptr) guard.get()->insertSilence(frameCount);
-}
-
 JNIEXPORT jstring JNICALL Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeSetMonitoringEnabled(
     JNIEnv *env, jobject, jlong handle, jboolean enabled, jint outputDeviceId) {
     EngineGuard guard(handle);
@@ -194,6 +189,24 @@ JNIEXPORT jint JNICALL Java_com_aucampro_recorder_audio_NativeEngineBridge_nativ
     return guard.get() != nullptr ? guard.get()->ringBufferOverrunCount() : 0;
 }
 
+JNIEXPORT jlong JNICALL Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeRingBufferDroppedFrameCount(
+    JNIEnv *, jobject, jlong handle) {
+    EngineGuard guard(handle);
+    return guard.get() != nullptr ? guard.get()->ringBufferDroppedFrameCount() : 0;
+}
+
+JNIEXPORT jint JNICALL Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeRingBufferFillFrames(
+    JNIEnv *, jobject, jlong handle) {
+    EngineGuard guard(handle);
+    return guard.get() != nullptr ? guard.get()->ringBufferFillFrames() : 0;
+}
+
+JNIEXPORT jint JNICALL Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeRingBufferHighWaterFrames(
+    JNIEnv *, jobject, jlong handle) {
+    EngineGuard guard(handle);
+    return guard.get() != nullptr ? guard.get()->ringBufferHighWaterFrames() : 0;
+}
+
 JNIEXPORT jint JNICALL Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeHardwareXRunCount(JNIEnv *,
                                                                                                        jobject,
                                                                                                        jlong handle) {
@@ -201,12 +214,73 @@ JNIEXPORT jint JNICALL Java_com_aucampro_recorder_audio_NativeEngineBridge_nativ
     return guard.get() != nullptr ? guard.get()->hardwareXRunCount() : 0;
 }
 
-// Diagnostic (2026-07-18, monitor-noise investigation) — kept permanently, same as ringBufferOverrunCount/hardwareXRunCount — see
-// OboeFullDuplexEngine::monitorWriteShortfallCount's doc.
-JNIEXPORT jint JNICALL Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeMonitorWriteShortfallCount(
+JNIEXPORT jint JNICALL Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeMonitorBufferFillFrames(
     JNIEnv *, jobject, jlong handle) {
     EngineGuard guard(handle);
-    return guard.get() != nullptr ? guard.get()->monitorWriteShortfallCount() : 0;
+    return guard.get() != nullptr ? guard.get()->monitorBufferFillFrames() : 0;
+}
+
+JNIEXPORT jint JNICALL Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeMonitorBufferTargetFrames(
+    JNIEnv *, jobject, jlong handle) {
+    EngineGuard guard(handle);
+    return guard.get() != nullptr ? guard.get()->monitorBufferTargetFrames() : 0;
+}
+
+JNIEXPORT jint JNICALL Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeMonitorCorrectionPpm(
+    JNIEnv *, jobject, jlong handle) {
+    EngineGuard guard(handle);
+    return guard.get() != nullptr ? guard.get()->monitorCorrectionPpm() : 0;
+}
+
+JNIEXPORT jint JNICALL Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeMonitorUnderflowCount(
+    JNIEnv *, jobject, jlong handle) {
+    EngineGuard guard(handle);
+    return guard.get() != nullptr ? guard.get()->monitorUnderflowCount() : 0;
+}
+
+JNIEXPORT jlong JNICALL Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeMonitorUnderflowFrameCount(
+    JNIEnv *, jobject, jlong handle) {
+    EngineGuard guard(handle);
+    return guard.get() != nullptr ? guard.get()->monitorUnderflowFrameCount() : 0;
+}
+
+JNIEXPORT jint JNICALL Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeMonitorOverflowCount(
+    JNIEnv *, jobject, jlong handle) {
+    EngineGuard guard(handle);
+    return guard.get() != nullptr ? guard.get()->monitorOverflowCount() : 0;
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeMonitorOverflowDroppedFrameCount(
+    JNIEnv *, jobject, jlong handle) {
+    EngineGuard guard(handle);
+    return guard.get() != nullptr ? guard.get()->monitorOverflowDroppedFrameCount() : 0;
+}
+
+JNIEXPORT jint JNICALL Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeMonitorResyncCount(
+    JNIEnv *, jobject, jlong handle) {
+    EngineGuard guard(handle);
+    return guard.get() != nullptr ? guard.get()->monitorResyncCount() : 0;
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeMonitorInputCallbackFrameCount(
+    JNIEnv *, jobject, jlong handle) {
+    EngineGuard guard(handle);
+    return guard.get() != nullptr ? guard.get()->monitorInputCallbackFrameCount() : 0;
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeMonitorOutputCallbackFrameCount(
+    JNIEnv *, jobject, jlong handle) {
+    EngineGuard guard(handle);
+    return guard.get() != nullptr ? guard.get()->monitorOutputCallbackFrameCount() : 0;
+}
+
+JNIEXPORT jint JNICALL Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeMonitorOutputXRunCount(
+    JNIEnv *, jobject, jlong handle) {
+    EngineGuard guard(handle);
+    return guard.get() != nullptr ? guard.get()->monitorOutputXRunCount() : 0;
 }
 
 // Returns [framePosition, timeNanos] (CLOCK_MONOTONIC), or null if unavailable. See
@@ -236,13 +310,71 @@ JNIEXPORT jint JNICALL Java_com_aucampro_recorder_audio_NativeEngineBridge_nativ
     JNIEnv *env, jobject, jlong handle, jfloatArray dst, jint maxFrames) {
     EngineGuard guard(handle);
     if (guard.get() == nullptr) return 0;
-    std::vector<float> scratch(static_cast<size_t>(maxFrames) * aucampro::OboeFullDuplexEngine::kChannelCount);
-    const size_t framesRead = guard.get()->drainEncoderBuffer(scratch.data(), static_cast<size_t>(maxFrames));
-    if (framesRead > 0) {
-        env->SetFloatArrayRegion(dst, 0, static_cast<jsize>(framesRead * aucampro::OboeFullDuplexEngine::kChannelCount),
-                                  scratch.data());
-    }
+
+    const jsize requiredSamples =
+        maxFrames * aucampro::OboeFullDuplexEngine::kChannelCount;
+    if (maxFrames <= 0 || env->GetArrayLength(dst) < requiredSamples) return 0;
+
+    // The old path allocated a native vector and then copied it into the Java array on
+    // every ~10ms drain. At 192kHz that steady allocation/copy load contributed directly
+    // to the consumer falling behind the capture callback. Pin (or VM-copy) the already
+    // reused Kotlin scratch array for the very short lock-free read instead.
+    auto *samples = static_cast<jfloat *>(env->GetPrimitiveArrayCritical(dst, nullptr));
+    if (samples == nullptr) return 0;
+    const size_t framesRead =
+        guard.get()->drainEncoderBuffer(samples, static_cast<size_t>(maxFrames));
+    env->ReleasePrimitiveArrayCritical(dst, samples, 0);
     return static_cast<jint>(framesRead);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeResetEncoderPcmConverter(
+    JNIEnv *, jobject, jlong handle, jint inputSampleRateHz,
+    jint outputSampleRateHz, jint channelCount, jint randomSeed) {
+    EngineGuard guard(handle);
+    if (guard.get() == nullptr) return JNI_FALSE;
+    return guard.get()->resetEncoderPcmConverter(
+               inputSampleRateHz, outputSampleRateHz, channelCount,
+               static_cast<uint32_t>(randomSeed))
+               ? JNI_TRUE
+               : JNI_FALSE;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_aucampro_recorder_audio_NativeEngineBridge_nativeConvertEncoderPcm(
+    JNIEnv *env, jobject, jlong handle, jfloatArray input, jint frameCount,
+    jshortArray output) {
+    EngineGuard guard(handle);
+    if (guard.get() == nullptr || frameCount <= 0) return 0;
+
+    constexpr size_t kMaxOutputSamples = 8192;
+    const size_t inputSamples =
+        static_cast<size_t>(frameCount) *
+        aucampro::OboeFullDuplexEngine::kChannelCount;
+    const size_t outputFrames =
+        guard.get()->encoderPcmOutputFrameUpperBound(
+            static_cast<size_t>(frameCount));
+    const size_t outputSamples =
+        outputFrames * aucampro::OboeFullDuplexEngine::kChannelCount;
+    if (outputFrames == 0 || outputSamples > kMaxOutputSamples ||
+        env->GetArrayLength(input) < static_cast<jsize>(inputSamples) ||
+        env->GetArrayLength(output) < static_cast<jsize>(outputSamples)) {
+        return 0;
+    }
+
+    std::array<jshort, kMaxOutputSamples> converted{};
+    auto *inputSamplesCritical =
+        static_cast<jfloat *>(env->GetPrimitiveArrayCritical(input, nullptr));
+    if (inputSamplesCritical == nullptr) return 0;
+    const size_t convertedFrames = guard.get()->convertEncoderPcm(
+        inputSamplesCritical, static_cast<size_t>(frameCount),
+        converted.data());
+    env->ReleasePrimitiveArrayCritical(input, inputSamplesCritical, JNI_ABORT);
+
+    const jsize convertedSamples = static_cast<jsize>(
+        convertedFrames * aucampro::OboeFullDuplexEngine::kChannelCount);
+    env->SetShortArrayRegion(output, 0, convertedSamples, converted.data());
+    return static_cast<jint>(convertedFrames);
 }
 
 // Discards any stale backlog before a fresh AudioEncoder starts draining. See

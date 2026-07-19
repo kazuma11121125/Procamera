@@ -3,17 +3,19 @@ package com.aucampro.recorder.encoder
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.os.Process
 import android.util.Log
 import com.aucampro.recorder.audio.NativeEngineBridge
 import com.aucampro.recorder.muxer.PtsClockDomain
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 
 /**
  * Dedicated thread (§4.4: "専用エンコーダスレッドがRingBufferからドレインしqueueInputBuffer")
- * draining the native SPSC ring buffer, converting Float32 -> 16-bit PCM via TPDF dither
- * (§4.2, [PcmDither]), and feeding MediaCodec's AAC-LC encoder in synchronous buffer
- * mode. Audio PTS is derived purely from cumulative sample count (§4.3,
+ * draining the native SPSC ring buffer, converting Float32 -> 16-bit PCM with anti-alias
+ * decimation and TPDF dither in [NativeEngineBridge], and feeding MediaCodec's AAC-LC
+ * encoder in synchronous buffer mode. Audio PTS is derived purely from cumulative sample count (§4.3,
  * drift-free) via [ptsClockDomain] — never from this thread's wall-clock timing.
  *
  * Untested framework glue (needs a live MediaCodec + running NativeEngineBridge) — see
@@ -25,8 +27,8 @@ import kotlin.concurrent.thread
  * 48kHz target — see that doc's §4 "大原則"). When they differ, this class is the fan-out
  * point (the *sole* consumer of the SPSC ring buffer — see [NativeEngineBridge]'s class
  * doc): every drained block is written to [hiResSink] unmodified (raw, at
- * [captureSampleRateHz]), then decimated down to [sampleRateHz] via [decimator] before
- * dithering/encoding to AAC, exactly as it always has. [cumulativeSampleCount] and every
+ * [captureSampleRateHz]), then converted natively down to [sampleRateHz] before
+ * encoding to AAC. [cumulativeSampleCount] and every
  * PTS derived from it stay in **48kHz-equivalent frame units** throughout — see
  * [seedAudioAnchor]'s doc for the one place that distinction is easy to get backwards.
  */
@@ -53,14 +55,34 @@ class AudioEncoder(
     }
 
     private val decimationFactor = captureSampleRateHz / sampleRateHz
-    private val decimator: Decimator? =
-        if (decimationFactor > 1) Decimator(captureSampleRateHz, sampleRateHz, channelCount) else null
 
     private val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
     private val running = AtomicBoolean(false)
     private var drainThread: Thread? = null
     private var cumulativeSampleCount = 0L
     private var formatAnnounced = false
+
+    // §12/§14 of docs/AUDIO_INSTABILITY_INVESTIGATION_2026-07-18.md called for these as
+    // "必須診断値" but only a per-event log line existed (queueInput()'s retry-recovered
+    // Log.w) — nothing queryable to correlate against an audible glitch's timestamp during
+    // a live repro session. Written only from [drainThread] (inside [queueInput]); read
+    // from any thread (e.g. a periodic diagnostic poller), same pattern as
+    // [NativeEngineBridge]'s ring-buffer counters.
+    private val aacInputRetryCount = AtomicLong(0)
+    private val aacInputMaxWaitNanos = AtomicLong(0)
+    private val aacInputTimeoutFailureCount = AtomicLong(0)
+
+    /** Cumulative [MediaCodec.dequeueInputBuffer] retries this recording has needed so far
+     * (0 under normal conditions). Any thread. */
+    fun aacInputRetryCount(): Long = aacInputRetryCount.get()
+
+    /** Longest single [queueInput] call so far, including all its retries. Any thread. */
+    fun aacInputMaxWaitNanos(): Long = aacInputMaxWaitNanos.get()
+
+    /** How many times [queueInput] exhausted its retry budget and threw (each such
+     * failure also stops the recording via [Callback.onError], so this is normally either
+     * 0 or 1 per take). Any thread. */
+    fun aacInputTimeoutFailureCount(): Long = aacInputTimeoutFailureCount.get()
 
     init {
         val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRateHz, channelCount).apply {
@@ -85,9 +107,28 @@ class AudioEncoder(
      * the retry budget.
      */
     fun start() {
+        check(
+            nativeEngine.resetEncoderPcmConverter(
+                inputSampleRateHz = captureSampleRateHz,
+                outputSampleRateHz = sampleRateHz,
+                channelCount = channelCount,
+                randomSeed = System.nanoTime().toInt(),
+            ),
+        ) {
+            "Failed to configure native encoder PCM converter: " +
+                "${captureSampleRateHz}Hz -> ${sampleRateHz}Hz, channels=$channelCount"
+        }
         codec.start()
         running.set(true)
-        drainThread = thread(name = "AudioEncoderDrain", priority = Thread.NORM_PRIORITY) {
+        drainThread = thread(name = "AudioEncoderDrain", priority = Thread.MAX_PRIORITY) {
+            // This is a recording-critical real-time consumer, not background encoding:
+            // if Android starves it while the 192kHz capture callback keeps producing,
+            // the finite native ring eventually overruns and both WAV and MP4 lose the
+            // same interval. A five-minute SO-51C stress take reproduced exactly that
+            // under ~92% total CPU load (the normal-priority thread fell ~18s behind).
+            // Android's audio priority keeps capture draining during those system-load
+            // bursts; MediaCodec and file I/O remain non-RT operations on this thread.
+            Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
             seedAudioAnchor()
             drainLoop()
         }
@@ -99,7 +140,7 @@ class AudioEncoder(
      * continuous metering — see [com.aucampro.recorder.pipeline.RecordingPipeline
      * .ensureAudioEngineStarted]'s doc). That means by the time a *second-or-later*
      * recording's [AudioEncoder] starts, the ring buffer can be holding a stale backlog —
-     * up to its ~10s capacity, frozen there since nothing drained it during preview-only
+     * up to its full capacity, frozen there since nothing drained it during preview-only
      * (or nothing at all if preview ran long enough to overflow it, silently dropping
      * every write since as an overrun; see SpscRingBuffer's write()). Confirmed on a real
      * device: a recording started ~87s into preview lost effectively all of its audio
@@ -163,7 +204,7 @@ class AudioEncoder(
      * Real-device finding (Sony SO-51C): this used to call `codec.stop()`/`codec.release()`
      * itself right after a *timed* `join()`. `Thread.join(timeout)` returns whether or not
      * the thread actually finished — under load (heavy background GC, muxer lock
-     * contention from [com.aucampro.recorder.muxer.SegmentedMuxerController]'s shared
+     * contention from [com.aucampro.recorder.muxer.MuxerController]'s shared
      * lock — see its class doc) [drainThread]'s own post-EOS drain could still be mid
      * `queueInput()`/`dequeueInputBuffer()` when the timeout elapsed, so the caller's
      * `codec.release()` raced it and threw `IllegalStateException: codec is released
@@ -203,81 +244,125 @@ class AudioEncoder(
 
     private fun drainLoop() {
         // Sized in *capture-rate* frames — [framesPerBlock] frames raw drain from the ring
-        // buffer, then (when [decimator] is active) decimated down to ~[FRAMES_PER_BLOCK]
-        // frames' worth of AAC input, keeping this loop's steady-state cadence the same
-        // regardless of [captureSampleRateHz] (docs/HIRES_AUDIO_DESIGN.md §6.5's
-        // FRAMES_PER_BLOCK note).
+        // buffer, then converted natively down to ~[FRAMES_PER_BLOCK] frames' worth of AAC
+        // input, keeping this loop's steady-state cadence the same regardless of
+        // [captureSampleRateHz] (docs/HIRES_AUDIO_DESIGN.md §6.5).
         val framesPerBlock = FRAMES_PER_BLOCK * decimationFactor
         val rawScratch = FloatArray(framesPerBlock * channelCount)
-        val decimatedScratch = FloatArray(framesPerBlock * channelCount)
         val shortScratch = ShortArray(FRAMES_PER_BLOCK * channelCount)
         val byteScratch = java.nio.ByteBuffer.allocateDirect(shortScratch.size * 2).order(java.nio.ByteOrder.LITTLE_ENDIAN)
         val bufferInfo = MediaCodec.BufferInfo()
+        val profileStartNanos = System.nanoTime()
+        var profileBlockCount = 0L
+        var profileRawFrames = 0L
+        var drainNanos = 0L
+        var wavNanos = 0L
+        var converterNanos = 0L
+        var packNanos = 0L
+        var codecInputNanos = 0L
+        var codecOutputNanos = 0L
+        var suppressedPtsBlockCount = 0L
+        var lastSuppressedPtsLogNanos = 0L
+
+        fun logDrainProfileIfDue() {
+            if (profileBlockCount == 0L ||
+                profileBlockCount % PROFILE_LOG_INTERVAL_BLOCKS != 0L
+            ) {
+                return
+            }
+            val wallMs = (System.nanoTime() - profileStartNanos) / 1_000_000L
+            val capturedMs = profileRawFrames * 1000L / captureSampleRateHz
+            fun averageUs(totalNanos: Long): Long =
+                totalNanos / profileBlockCount / 1_000L
+            Log.i(
+                TAG,
+                "Audio drain profile: blocks=$profileBlockCount rawFrames=$profileRawFrames " +
+                    "capturedMs=$capturedMs wallMs=$wallMs " +
+                    "avgUs[drain=${averageUs(drainNanos)},wav=${averageUs(wavNanos)}," +
+                    "nativeConvert=${averageUs(converterNanos)}," +
+                    "pack=${averageUs(packNanos)},codecIn=${averageUs(codecInputNanos)}," +
+                    "codecOut=${averageUs(codecOutputNanos)}] " +
+                    "ringFill=${nativeEngine.ringBufferFillFrames()} " +
+                    "ringDropped=${nativeEngine.ringBufferDroppedFrameCount()}",
+            )
+        }
 
         // One drain+encode attempt. Returns false only when the ring buffer was empty (the
         // "nothing left to do right now" case both the steady-state loop and the final
         // drain below need to distinguish from "encoded a block, possibly non-monotonic").
         fun drainOneBlock(): Boolean {
+            var stageStartNanos = System.nanoTime()
             val rawFramesRead = nativeEngine.drainEncoderBuffer(rawScratch, framesPerBlock)
+            drainNanos += System.nanoTime() - stageStartNanos
             if (rawFramesRead == 0) return false
+            profileRawFrames += rawFramesRead
 
             // Fan-out per docs/HIRES_AUDIO_DESIGN.md §4: the WAV sidecar gets the raw,
             // undecimated block exactly as captured — this is the *only* other consumer of
             // this block, driven from this same drain thread (never a second ring-buffer
             // reader; see NativeEngineBridge's class doc on the SPSC invariant).
+            stageStartNanos = System.nanoTime()
             hiResSink?.writeFrames(rawScratch, rawFramesRead)
+            wavNanos += System.nanoTime() - stageStartNanos
 
-            val aacScratch: FloatArray
-            val framesRead: Int
-            if (decimator != null) {
-                framesRead = decimator.process(rawScratch, rawFramesRead, decimatedScratch)
-                aacScratch = decimatedScratch
-                // A small raw block can decimate down to zero output frames (e.g. 3 raw
-                // frames at a 4:1 factor) — the ring buffer genuinely had data (so the
-                // caller should keep draining, not sleep), there's just nothing to feed
-                // the AAC path yet this call.
-                if (framesRead == 0) return true
-            } else {
-                framesRead = rawFramesRead
-                aacScratch = rawScratch
-            }
+            // The old Kotlin Decimator + Random.Default TPDF path consumed 15-18ms of
+            // this block's 21.3ms real-time budget after the SO-51C warmed up. Native
+            // conversion performs the identical 8th-order anti-alias filter, decimation,
+            // TPDF dither, and Int16 quantization in one JNI call.
+            stageStartNanos = System.nanoTime()
+            val framesRead =
+                nativeEngine.convertEncoderPcm(rawScratch, rawFramesRead, shortScratch)
+            converterNanos += System.nanoTime() - stageStartNanos
+            // A very small raw block can produce no output at an integer decimation
+            // boundary. Data was consumed, so keep draining instead of sleeping.
+            if (framesRead == 0) return true
             val sampleCount = framesRead * channelCount
-
-            // In place on the reused scratch buffers, converting only the first
-            // sampleCount elements — framesRead is rarely a full FRAMES_PER_BLOCK (the
-            // native ring buffer's available frames vary block to block), so a naive
-            // size-matched output buffer would only ever be `shortScratch` itself on
-            // the rare exact-size block; every other block previously got a throwaway
-            // array that the read loop below never actually read from, silently
-            // feeding the encoder stale/reused shortScratch content instead of the
-            // just-converted samples (real-device finding: this is what made recorded
-            // audio sound like garbled noise rather than the captured signal).
-            PcmDither.floatToInt16Tpdf(aacScratch, shortScratch, sampleCount)
 
             val ptsUs = ptsClockDomain.normalizeAudioPtsUs(cumulativeSampleCount, sampleRateHz)
             cumulativeSampleCount += framesRead
             if (ptsUs == null) {
-                // Non-monotonic (shouldn't happen for a purely-increasing counter, but
-                // guarded per §4.3) — logged rather than silently dropped: this exact
-                // silent path is what hid the seedAudioAnchor bug (see its doc) until a
-                // real-device file-level check caught the missing audio.
-                Log.w(TAG, "Audio frame dropped: PTS not monotonic (cumulativeSampleCount=$cumulativeSampleCount)")
+                // Audio captured before the first video frame establishes epoch zero is
+                // intentionally suppressed. Once video has started, rate-limit any
+                // continued monotonic-guard suppression; per-block logging here used to
+                // produce hundreds of logcat writes during camera-session warmup.
+                suppressedPtsBlockCount += 1
+                val nowNanos = System.nanoTime()
+                if (ptsClockDomain.isStarted() &&
+                    nowNanos - lastSuppressedPtsLogNanos >=
+                    SUPPRESSED_PTS_LOG_INTERVAL_NS
+                ) {
+                    Log.w(
+                        TAG,
+                        "Audio PTS blocks suppressed=$suppressedPtsBlockCount " +
+                            "(waiting for audio timeline to reach video epoch; " +
+                            "cumulativeSampleCount=$cumulativeSampleCount)",
+                    )
+                    lastSuppressedPtsLogNanos = nowNanos
+                }
                 return true
             }
 
+            stageStartNanos = System.nanoTime()
             byteScratch.clear()
             for (i in 0 until sampleCount) {
                 byteScratch.putShort(shortScratch[i])
             }
             byteScratch.flip()
+            packNanos += System.nanoTime() - stageStartNanos
 
-            queueInput(byteScratch, ptsUs, endOfStream = false)
+            stageStartNanos = System.nanoTime()
+            queueInput(byteScratch, ptsUs, endOfStream = false, bufferInfo)
+            codecInputNanos += System.nanoTime() - stageStartNanos
+            profileBlockCount += 1
+            logDrainProfileIfDue()
             return true
         }
 
         try {
             while (running.get()) {
+                val outputStartNanos = System.nanoTime()
                 drainOutputAvailable(bufferInfo)
+                codecOutputNanos += System.nanoTime() - outputStartNanos
                 if (!drainOneBlock()) {
                     Thread.sleep(BUFFER_EMPTY_SLEEP_MS)
                 }
@@ -289,17 +374,39 @@ class AudioEncoder(
             // reaching the encoder. drainOutputAvailable keeps pace alongside so this
             // doesn't exhaust MediaCodec's input buffer pool if the backlog is large.
             while (drainOneBlock()) {
+                val outputStartNanos = System.nanoTime()
                 drainOutputAvailable(bufferInfo)
+                codecOutputNanos += System.nanoTime() - outputStartNanos
             }
 
             // Final EOS buffer, per §4.4's stop sequence (EOS -> drain all pending output -> stop/release).
             val finalPtsUs = ptsClockDomain.normalizeAudioPtsUs(cumulativeSampleCount, sampleRateHz)
                 ?: (cumulativeSampleCount * 1_000_000L / sampleRateHz)
-            queueInput(java.nio.ByteBuffer.allocateDirect(0), finalPtsUs, endOfStream = true)
+            queueInput(
+                java.nio.ByteBuffer.allocateDirect(0),
+                finalPtsUs,
+                endOfStream = true,
+                bufferInfo,
+            )
             drainOutputUntilEos(bufferInfo)
         } catch (e: Exception) {
             callback.onError(e)
         } finally {
+            // One line per take is enough to diagnose whether the capture producer ever
+            // outran this consumer. Logging the high-water mark from the preview meter
+            // loop would be misleading/noisy because no encoder consumer exists before
+            // REC and start() deliberately flushes that stale preview backlog.
+            Log.i(
+                TAG,
+                "Recording audio ring summary: overruns=" +
+                    nativeEngine.ringBufferOverrunCount() +
+                    ", droppedFrames=" + nativeEngine.ringBufferDroppedFrameCount() +
+                    ", highWaterFrames=" + nativeEngine.ringBufferHighWaterFrames() +
+                    ", finalFillFrames=" + nativeEngine.ringBufferFillFrames() +
+                    ", aacInputRetries=" + aacInputRetryCount.get() +
+                    ", aacInputMaxWaitMs=" + (aacInputMaxWaitNanos.get() / 1_000_000L) +
+                    ", aacInputTimeoutFailures=" + aacInputTimeoutFailureCount.get(),
+            )
             // Only this thread ever calls dequeue/queueInputBuffer, so it's the only safe
             // owner of stop()/release() too — see [stop]'s doc for the cross-thread race
             // this replaced. Same reasoning extends to hiResSink: this is the only thread
@@ -316,14 +423,73 @@ class AudioEncoder(
         }
     }
 
-    private fun queueInput(data: java.nio.ByteBuffer, ptsUs: Long, endOfStream: Boolean) {
-        val inputIndex = codec.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
-        if (inputIndex < 0) return
-        val inputBuffer = codec.getInputBuffer(inputIndex) ?: return
-        inputBuffer.clear()
-        inputBuffer.put(data)
-        val flags = if (endOfStream) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0
-        codec.queueInputBuffer(inputIndex, 0, data.position(), ptsUs, flags)
+    /**
+     * Queues one complete PCM block without silently discarding it.
+     *
+     * A busy codec is normal under momentary system load: dequeueInputBuffer() returning
+     * INFO_TRY_AGAIN_LATER means "retry", not that the caller-owned PCM may be dropped.
+     * The previous single 10ms attempt returned without telling [drainOneBlock], which had
+     * already advanced [cumulativeSampleCount]. That produced an AAC timestamp hole and
+     * an audible skip/fast-forward while the WAV path still contained that particular
+     * block. Drain available output between retries so the codec can recycle an input
+     * buffer even when its output side was the source of backpressure.
+     */
+    private fun queueInput(
+        data: java.nio.ByteBuffer,
+        ptsUs: Long,
+        endOfStream: Boolean,
+        bufferInfo: MediaCodec.BufferInfo,
+    ) {
+        val size = data.remaining()
+        val callStartNanos = System.nanoTime()
+        val deadlineNanos = callStartNanos + CODEC_INPUT_WAIT_TIMEOUT_NS
+        var retryCount = 0
+        while (true) {
+            val inputIndex = codec.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
+            if (inputIndex >= 0) {
+                val inputBuffer = codec.getInputBuffer(inputIndex)
+                    ?: throw IllegalStateException(
+                        "MediaCodec returned input index $inputIndex without a buffer",
+                    )
+                check(size <= inputBuffer.capacity()) {
+                    "PCM block ($size bytes) exceeds codec input capacity " +
+                        "(${inputBuffer.capacity()} bytes)"
+                }
+                inputBuffer.clear()
+                inputBuffer.put(data)
+                val flags = if (endOfStream) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0
+                codec.queueInputBuffer(inputIndex, 0, size, ptsUs, flags)
+                if (retryCount > 0) {
+                    recordQueueInputRetry(retryCount, System.nanoTime() - callStartNanos)
+                    Log.w(
+                        TAG,
+                        "MediaCodec input recovered after $retryCount retries " +
+                            "(ptsUs=$ptsUs, bytes=$size, eos=$endOfStream)",
+                    )
+                }
+                return
+            }
+
+            retryCount += 1
+            drainOutputAvailable(bufferInfo)
+            if (System.nanoTime() >= deadlineNanos) {
+                recordQueueInputRetry(retryCount, System.nanoTime() - callStartNanos)
+                aacInputTimeoutFailureCount.incrementAndGet()
+                throw IllegalStateException(
+                    "Timed out waiting for MediaCodec input; refusing to silently drop " +
+                        "$size PCM bytes at ptsUs=$ptsUs after $retryCount retries",
+                )
+            }
+        }
+    }
+
+    /** Drain-thread only (see [queueInput]'s only caller). */
+    private fun recordQueueInputRetry(retryCount: Int, waitNanos: Long) {
+        aacInputRetryCount.addAndGet(retryCount.toLong())
+        var currentMax = aacInputMaxWaitNanos.get()
+        while (waitNanos > currentMax && !aacInputMaxWaitNanos.compareAndSet(currentMax, waitNanos)) {
+            currentMax = aacInputMaxWaitNanos.get()
+        }
     }
 
     private fun drainOutputAvailable(bufferInfo: MediaCodec.BufferInfo) {
@@ -369,18 +535,28 @@ class AudioEncoder(
     private companion object {
         const val TAG = "AudioEncoder"
         const val DEQUEUE_TIMEOUT_US = 10_000L
+        // One dequeue attempt remains short so output can be drained between retries.
+        // queueInput() applies the overall bounded wait and never treats a single timeout
+        // as permission to discard caller-owned PCM.
+        const val CODEC_INPUT_WAIT_TIMEOUT_NS = 2_000_000_000L
+        // Roughly every 10.9s at the AAC-LC 1024-frame cadence. The temporary 64-block
+        // interval used during profiling was intentionally noisy (~1.3s).
+        const val PROFILE_LOG_INTERVAL_BLOCKS = 512L
+        const val SUPPRESSED_PTS_LOG_INTERVAL_NS = 1_000_000_000L
+
         // 5ms rather than the original 2ms — PERF_INVESTIGATION_2026-07-17.md P7: this
         // thread runs for the whole preview/recording lifetime (not just while actively
         // draining), so its steady-state wakeup rate is a real, continuous cost. A block is
-        // ~10.7ms of audio (FRAMES_PER_BLOCK @48kHz), so polling at 5ms still drains with
-        // more than 2x headroom before the ring buffer could back up.
+        // ~21.3ms of audio (FRAMES_PER_BLOCK @48kHz), so polling at 5ms still drains with
+        // more than 4x headroom before the ring buffer could back up.
         const val BUFFER_EMPTY_SLEEP_MS = 5L
         const val DRAIN_THREAD_JOIN_TIMEOUT_MS = 3_000L
 
-        // Drain granularity: ~10.7ms @48kHz, comfortably below the ring buffer's ~10s
-        // capacity headroom (OboeFullDuplexEngine::kRingBufferCapacityFrames) and small
-        // enough to keep the AAC encoder's input latency low.
-        const val FRAMES_PER_BLOCK = 512
+        // One native AAC-LC access unit is 1024 PCM frames. Matching that granularity
+        // halves JNI, PCM conversion, WAV write, and MediaCodec calls compared with the
+        // old 512-frame blocks while staying at only ~21.3ms @48kHz. At 192kHz the raw
+        // drain scales to 4096 frames and still represents the same wall-clock duration.
+        const val FRAMES_PER_BLOCK = 1024
 
         // 200 attempts * 10ms = 2000ms budget. A 250ms budget was empirically too short
         // on real hardware (Sony SO-51C): AAudio's getTimestamp() reliably returned

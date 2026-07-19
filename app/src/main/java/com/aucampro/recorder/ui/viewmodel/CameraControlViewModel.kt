@@ -41,7 +41,6 @@ import kotlinx.coroutines.launch
  * - [setWbAuto] / [setKelvin]: toggle Auto AWB vs manual Kelvin.
  * - [openSettings] / [closeSettings]: drive [SettingsState.showSettingsSheet].
  * - [setStorageLocation]: persist SAF URI or standard location choice.
- * - [setSegmentDuration]: configures segment duration forwarded to [RecordingPipeline].
  */
 class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -103,7 +102,7 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         // Registers this ViewModel's single RecordingPipeline instance with the
         // Application-level crash handler so an uncaught exception can attempt a
         // best-effort finalize of whatever segment is currently open (§4.6) — see
-        // AuCamPROApplication and RecordingPipeline.emergencyFinalizeCurrentSegment's docs.
+        // AuCamPROApplication and RecordingPipeline.emergencyFinalizeRecording's docs.
         (app as? com.aucampro.recorder.AuCamPROApplication)?.activeRecordingPipeline = pipeline
 
         // §4.6: monitor for the whole time this screen is up (not just while recording —
@@ -325,7 +324,6 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         setHighPassCutoffHz(saved.highPassCutoffHz)
         setMonitoringEnabled(saved.monitoringEnabled)
         setStorageLocation(saved.storageLocation)
-        saved.segmentDurationMinutes?.let(::setSegmentDuration)
         saved.eqBands.forEachIndexed { i, band ->
             if (band.freqHz != null && band.q != null && band.gainDb != null) {
                 setEqBand(i, band.freqHz, band.q, band.gainDb)
@@ -485,7 +483,6 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
                                 recordingState = RecordingUiState.Recording,
                                 outputDirectory = event.outputDirectory,
                                 recordingElapsedMs = 0L,
-                                currentSegment = 0,
                                 errorMessage = null,
                             )
                         }
@@ -804,14 +801,9 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         pipeline.setStorageLocation(location)
     }
 
-    fun setSegmentDuration(minutes: Int) {
-        _uiState.update { it.copy(settings = it.settings.copy(segmentDurationMinutes = minutes)) }
-        pipeline.setSegmentDurationMinutes(minutes)
-    }
-
     /**
      * Preview-only composition guide — no pipeline call, unlike [setStorageLocation]/
-     * [setSegmentDuration]: it never touches the encoder's output aspect ratio. See
+     * recording settings: it never touches the encoder's output aspect ratio. See
      * [FrameLineAspectRatio]'s doc for why.
      */
     fun setFrameLineAspectRatio(ratio: FrameLineAspectRatio) {
@@ -926,19 +918,102 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
             var lastPublishedClippingL = false
             var lastPublishedClippingR = false
             var lastLabelPublishMs = 0L
-            // Diagnostic (2026-07-18, monitor-noise investigation) — kept permanently, same as ringBufferOverrunCount/hardwareXRunCount — logs
-            // (not published to any StateFlow, so no UI/recomposition cost beyond one
-            // extra native getter call per tick) whenever
-            // NativeEngineBridge.monitorWriteShortfallCount() advances, to correlate
-            // audible monitor noise with actual dropped-frame events on a real device.
-            var lastMonitorShortfallCount = 0
+            // Monitor-path diagnostics are logged at a low fixed rate while monitoring
+            // is on. Fill/target and drift correction make slow input/output clock drift
+            // visible; underflow/overflow/resync counters identify audible discontinuities.
+            var lastMonitorDiagnosticLogMs = 0L
+            var lastMonitorInputCallbackFrames = 0L
+            var lastMonitorOutputCallbackFrames = 0L
+            // Recorded-audio diagnostics remain separate from the monitor-only counters
+            // above: a monitor underflow/resync does not imply lost recorded audio. Until
+            // now ringBufferOverrunCount/hardwareXRunCount were only ever surfaced in the
+            // UI's OVRN/XRUN stat chips (MainScreen.kt), never logcat — meaning a logcat-only
+            // real-device repro (as opposed to someone watching the screen at the exact
+            // moment) had no way to correlate an audible click/dropout *in the recorded
+            // file* with an actual encoder-side frame loss. Logged only while recording:
+            // during preview there is deliberately no encoder consumer, and the stale
+            // ring backlog is flushed when REC starts.
+            var lastRingBufferOverrunCount = 0
+            var lastRingBufferDroppedFrameCount = 0L
+            var lastHardwareXRunCount = 0
+            // AAC-encode-side and Muxer-IO-side counters (docs/AUDIO_INSTABILITY_
+            // INVESTIGATION_2026-07-18.md §12) folded into the same recorded-audio log
+            // line/trigger as the ring-buffer counters above — all four describe the
+            // saved WAV/MP4 path, never the live monitor.
+            var lastAacInputRetryCount = 0L
+            var lastAacInputTimeoutFailureCount = 0L
+            var lastMuxerIoQueueBlockCount = 0L
+            var lastRecordingDiagnosticLogMs = 0L
             while (isActive) {
                 delay(METER_POLL_INTERVAL_MS)
-                val monitorShortfallCount = pipeline.nativeEngine.monitorWriteShortfallCount()
-                if (monitorShortfallCount != lastMonitorShortfallCount) {
-                    Log.i(TAG, "monitorWriteShortfallCount: $lastMonitorShortfallCount -> $monitorShortfallCount")
-                    lastMonitorShortfallCount = monitorShortfallCount
+                val diagnosticNowMs = System.currentTimeMillis()
+                if (_uiState.value.monitoringEnabled &&
+                    diagnosticNowMs - lastMonitorDiagnosticLogMs >=
+                    MONITOR_DIAGNOSTIC_LOG_INTERVAL_MS
+                ) {
+                    val inputCallbackFrames =
+                        pipeline.nativeEngine.monitorInputCallbackFrameCount()
+                    val outputCallbackFrames =
+                        pipeline.nativeEngine.monitorOutputCallbackFrameCount()
+                    Log.i(
+                        TAG,
+                        "Monitor diagnostics: " +
+                            "fill=${pipeline.nativeEngine.monitorBufferFillFrames()}/" +
+                            "${pipeline.nativeEngine.monitorBufferTargetFrames()} frames, " +
+                            "correction=${pipeline.nativeEngine.monitorCorrectionPpm()}ppm, " +
+                            "underflows=${pipeline.nativeEngine.monitorUnderflowCount()}" +
+                            "(${pipeline.nativeEngine.monitorUnderflowFrameCount()} frames), " +
+                            "overflows=${pipeline.nativeEngine.monitorOverflowCount()}" +
+                            "(${pipeline.nativeEngine.monitorOverflowDroppedFrameCount()} frames), " +
+                            "resyncs=${pipeline.nativeEngine.monitorResyncCount()}, " +
+                            "outputXRuns=${pipeline.nativeEngine.monitorOutputXRunCount()}, " +
+                            "callbackFrames=" +
+                            "${inputCallbackFrames - lastMonitorInputCallbackFrames}/" +
+                            "${outputCallbackFrames - lastMonitorOutputCallbackFrames}" +
+                            "(input/output)",
+                    )
+                    lastMonitorInputCallbackFrames = inputCallbackFrames
+                    lastMonitorOutputCallbackFrames = outputCallbackFrames
+                    lastMonitorDiagnosticLogMs = diagnosticNowMs
                 }
+                val ringBufferOverrunCount = pipeline.nativeEngine.ringBufferOverrunCount()
+                val ringBufferDroppedFrameCount =
+                    pipeline.nativeEngine.ringBufferDroppedFrameCount()
+                val hardwareXRunCount = pipeline.nativeEngine.hardwareXRunCount()
+                val aacInputRetryCount = pipeline.aacInputRetryCount()
+                val aacInputTimeoutFailureCount = pipeline.aacInputTimeoutFailureCount()
+                val muxerIoQueueBlockCount = pipeline.muxerIoQueueBlockCount()
+                val recordingDiagnosticChanged =
+                    ringBufferOverrunCount != lastRingBufferOverrunCount ||
+                        ringBufferDroppedFrameCount != lastRingBufferDroppedFrameCount ||
+                        hardwareXRunCount != lastHardwareXRunCount ||
+                        aacInputRetryCount != lastAacInputRetryCount ||
+                        aacInputTimeoutFailureCount != lastAacInputTimeoutFailureCount ||
+                        muxerIoQueueBlockCount != lastMuxerIoQueueBlockCount
+                if (_uiState.value.isRecording && recordingDiagnosticChanged &&
+                    diagnosticNowMs - lastRecordingDiagnosticLogMs >=
+                    RECORDING_DIAGNOSTIC_LOG_INTERVAL_MS
+                ) {
+                    Log.w(
+                        TAG,
+                        "Recorded-audio diagnostics: overruns=$ringBufferOverrunCount, " +
+                            "droppedFrames=$ringBufferDroppedFrameCount, " +
+                            "hardwareXRuns=$hardwareXRunCount, " +
+                            "ringFill=${pipeline.nativeEngine.ringBufferFillFrames()} frames, " +
+                            "aacInputRetries=$aacInputRetryCount, " +
+                            "aacInputMaxWaitMs=${pipeline.aacInputMaxWaitNanos() / 1_000_000L}, " +
+                            "aacInputTimeoutFailures=$aacInputTimeoutFailureCount, " +
+                            "muxerIoQueueBlocks=$muxerIoQueueBlockCount, " +
+                            "muxerIoQueueBlockMaxMs=${pipeline.muxerIoQueueBlockMaxNanos() / 1_000_000L}",
+                    )
+                    lastRecordingDiagnosticLogMs = diagnosticNowMs
+                }
+                lastRingBufferOverrunCount = ringBufferOverrunCount
+                lastRingBufferDroppedFrameCount = ringBufferDroppedFrameCount
+                lastHardwareXRunCount = hardwareXRunCount
+                lastAacInputRetryCount = aacInputRetryCount
+                lastAacInputTimeoutFailureCount = aacInputTimeoutFailureCount
+                lastMuxerIoQueueBlockCount = muxerIoQueueBlockCount
                 // Quantized to METER_DB_STEP before publishing — real-device finding
                 // (PERF_INVESTIGATION_2026-07-17.md §2.3): peakDb/rmsDb are raw floats, so
                 // even silence-floor noise produced a *different* value on essentially
@@ -1150,7 +1225,6 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         val highPassCutoffHz: Float,
         val monitoringEnabled: Boolean,
         val storageLocation: StorageLocation,
-        val segmentDurationMinutes: Int,
         val videoConfig: CameraCapabilityInspector.VideoConfigCandidate?,
         val eqBands: List<EqBandState>,
     ) {
@@ -1170,7 +1244,6 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
             highPassCutoffHz = state.highPassCutoffHz,
             monitoringEnabled = state.monitoringEnabled,
             storageLocation = state.settings.storageLocation,
-            segmentDurationMinutes = state.settings.segmentDurationMinutes,
             videoConfig = state.selectedVideoConfig,
             eqBands = state.eqBands,
         )
@@ -1208,8 +1281,12 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
         /** See [startMeterPolling]'s `labelDue` doc — how often the numeric dBFS label is
          * allowed to refresh when nothing has crossed a bar segment boundary. ~5Hz is still
          * comfortably readable as a live number without redrawing on every sub-segment
-         * ambient-noise wobble. */
+        * ambient-noise wobble. */
         const val LABEL_PUBLISH_INTERVAL_MS = 200L
+        // Once audio loss starts, native counters can advance every callback. Preserve
+        // correlation value without adding a 20Hz logcat feedback load to the failure.
+        const val RECORDING_DIAGNOSTIC_LOG_INTERVAL_MS = 1_000L
+        const val MONITOR_DIAGNOSTIC_LOG_INTERVAL_MS = 5_000L
 
         /** See [histogramL1Distance]'s call site doc. Each of [LuminanceHistogramReader]'s
          * [com.aucampro.recorder.camera.LuminanceHistogramReader.HISTOGRAM_BIN_COUNT] bins

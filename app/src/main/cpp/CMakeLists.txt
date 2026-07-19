@@ -13,12 +13,14 @@ option(AUCAMPRO_ENABLE_SANITIZERS "Enable ASan+UBSan (debug builds only)" OFF)
 add_library(aucampro_native SHARED
     jni/native-lib.cpp
     engine/OboeFullDuplexEngine.cpp
+    engine/MonitorOutputPath.cpp
     dsp/BiquadEq.cpp
     dsp/SafetyLimiter.cpp
     dsp/PeakRmsMeter.cpp
     dsp/InputGain.cpp
     dsp/MakeupGain.cpp
     dsp/HighPassFilter.cpp
+    dsp/EncoderPcmConverter.cpp
 )
 
 find_package(oboe REQUIRED CONFIG)

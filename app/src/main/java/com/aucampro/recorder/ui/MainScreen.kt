@@ -109,7 +109,7 @@ import kotlin.math.roundToInt
  * Layout (portrait):
  * ```
  * ┌─────────────────────────────┐ ← statusBarsPadding
- * │ [● REC 00:12]  [SEG 1]  [▽]│  Status overlay (top)
+ * │ [● REC 00:12]          [▽] │  Status overlay (top)
  * │─────────────────────────────│
  * │                             │
  * │      CAMERA PREVIEW         │  SurfaceView (16:9 portion)
@@ -495,16 +495,8 @@ private fun StatusOverlay(
             )
         }
 
-        // ── Right: segment + storage ─────────────────────────────────────────
+        // ── Right: storage ───────────────────────────────────────────────────
         Column(horizontalAlignment = Alignment.End) {
-            if (state.isRecording) {
-                Text(
-                    text = "SEG ${state.currentSegment + 1}",
-                    color = OnSurfaceSecondary,
-                    fontSize = 10.sp,
-                    fontFamily = FontFamily.Monospace,
-                )
-            }
             Text(
                 text = state.storageRemainingFormatted,
                 color = OnSurfaceSecondary,
@@ -1509,4 +1501,3 @@ private fun EqBandRow(
         )
     }
 }
-

@@ -36,10 +36,74 @@ TEST(SpscRingBufferTest, WriteReturnsPartialCountWhenFull) {
     EXPECT_GT(written, 0u);
 }
 
+TEST(SpscRingBufferTest, AllOrNothingWriteNeverPublishesPartialBatch) {
+    SpscRingBuffer<int> rb(4);
+    const int initial[] = {1, 2, 3};
+    ASSERT_EQ(rb.writeAllOrNothing(initial, 3), 3u);
+
+    const int tooLarge[] = {4, 5};
+    EXPECT_EQ(rb.writeAllOrNothing(tooLarge, 2), 0u);
+
+    int output[4] = {};
+    ASSERT_EQ(rb.read(output, 4), 3u);
+    EXPECT_EQ(output[0], 1);
+    EXPECT_EQ(output[1], 2);
+    EXPECT_EQ(output[2], 3);
+}
+
+TEST(SpscRingBufferTest, AllOrNothingWritePreservesBatchAcrossWraparound) {
+    SpscRingBuffer<int> rb(4);
+    const int first[] = {1, 2, 3};
+    ASSERT_EQ(rb.writeAllOrNothing(first, 3), 3u);
+    int scratch[2] = {};
+    ASSERT_EQ(rb.read(scratch, 2), 2u);
+
+    const int wrapped[] = {4, 5, 6};
+    ASSERT_EQ(rb.writeAllOrNothing(wrapped, 3), 3u);
+    int output[4] = {};
+    ASSERT_EQ(rb.read(output, 4), 4u);
+    const std::vector<int> actual(output, output + 4);
+    EXPECT_EQ(actual, (std::vector<int>{3, 4, 5, 6}));
+}
+
 TEST(SpscRingBufferTest, ReadReturnsZeroWhenEmpty) {
     SpscRingBuffer<int> rb(8);
     int out[4];
     EXPECT_EQ(rb.read(out, 4), 0u);
+}
+
+TEST(SpscRingBufferTest, PeekDoesNotConsumeAndDiscardAdvancesCursor) {
+    SpscRingBuffer<int> rb(8);
+    const int input[] = {10, 20, 30, 40, 50};
+    ASSERT_EQ(rb.write(input, 5), 5u);
+
+    int peeked[3] = {};
+    ASSERT_EQ(rb.peek(peeked, 3), 3u);
+    EXPECT_EQ((std::vector<int>{peeked[0], peeked[1], peeked[2]}),
+              (std::vector<int>{10, 20, 30}));
+    EXPECT_EQ(rb.availableToRead(), 5u);
+
+    EXPECT_EQ(rb.discard(2), 2u);
+    EXPECT_EQ(rb.availableToRead(), 3u);
+
+    int output[4] = {};
+    ASSERT_EQ(rb.read(output, 4), 3u);
+    EXPECT_EQ((std::vector<int>{output[0], output[1], output[2]}),
+              (std::vector<int>{30, 40, 50}));
+}
+
+TEST(SpscRingBufferTest, PeekPreservesOrderAcrossWraparound) {
+    SpscRingBuffer<int> rb(4);
+    const int first[] = {1, 2, 3};
+    ASSERT_EQ(rb.write(first, 3), 3u);
+    EXPECT_EQ(rb.discard(2), 2u);
+    const int wrapped[] = {4, 5, 6};
+    ASSERT_EQ(rb.write(wrapped, 3), 3u);
+
+    int output[4] = {};
+    ASSERT_EQ(rb.peek(output, 4), 4u);
+    EXPECT_EQ((std::vector<int>{output[0], output[1], output[2], output[3]}),
+              (std::vector<int>{3, 4, 5, 6}));
 }
 
 TEST(SpscRingBufferTest, WraparoundPreservesOrder) {

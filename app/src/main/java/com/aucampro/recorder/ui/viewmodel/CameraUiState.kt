@@ -178,7 +178,6 @@ data class SettingsState(
     // in Settings still gets that choice honored (this only changes the *default* for
     // anyone who's never saved a preference — see UserPreferencesStore/PersistSnapshot).
     val storageLocation: StorageLocation = StorageLocation.PublicMovies,
-    val segmentDurationMinutes: Int = 5,  // 1, 5, 10, 15, 30
     val frameLineAspectRatio: FrameLineAspectRatio = FrameLineAspectRatio.Off,
     /** Manual mic override (§4.2) — see [AudioDeviceRouter.InputKind]'s doc. */
     val audioInputPreference: AudioDeviceRouter.InputKind = AudioDeviceRouter.InputKind.Auto,
@@ -219,7 +218,6 @@ data class CameraUiState(
     // ── Recording state ──────────────────────────────────────────────────────
     val recordingState: RecordingUiState = RecordingUiState.Idle,
     val recordingElapsedMs: Long = 0L,
-    val currentSegment: Int = 0,
     val outputDirectory: File? = null,
 
     // ── Camera capabilities (filled after first startPreview succeeds) ────────

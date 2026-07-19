@@ -26,7 +26,7 @@ import com.aucampro.recorder.encoder.AudioEncoder
 import com.aucampro.recorder.encoder.HiResAudioSink
 import com.aucampro.recorder.encoder.VideoEncoder
 import com.aucampro.recorder.muxer.PtsClockDomain
-import com.aucampro.recorder.muxer.SegmentedMuxerController
+import com.aucampro.recorder.muxer.MuxerController
 import com.aucampro.recorder.ui.viewmodel.StorageLocation
 import java.io.File
 import java.nio.ByteBuffer
@@ -495,14 +495,9 @@ class RecordingPipeline(private val context: Context) {
      *    device was plugged in while USB is already active). Falls back through the
      *    remaining candidates on failure, same reasoning as [ensureAudioEngineStarted].
      *
-     *    **実機未検証**: [insertSilence]'s frame count only approximates the true capture
-     *    gap with the wall-clock time this method itself takes to reopen the stream — no
-     *    hardware is available in this dev environment to verify that approximation
-     *    against a real device unplug. It keeps Audio PTS's cumulative-sample-count basis
-     *    (§4.3) monotonically advancing through the switch rather than jumping backward
-     *    relative to Video PTS, which is the property that actually matters; exact
-     *    silence-duration accuracy is a secondary concern for what is meant to be a rare,
-     *    brief event.
+     *    Native reopenInputStream() measures its own close/open gap and inserts silence
+     *    before starting the replacement callback. Keeping that write native-side avoids
+     *    racing a Kotlin silence producer against the new Oboe callback producer.
      *
      * 2. **Monitoring safety**: if monitoring is currently on and the headphone-type
      *    output that made it safe to enable (see [setMonitoringEnabled]'s doc) just
@@ -530,7 +525,6 @@ class RecordingPipeline(private val context: Context) {
         if (preferred.id == activeInputDeviceId) return
 
         Log.i(TAG, "Input device set changed, switching to ${audioDeviceRouter.labelFor(preferred)} (id=${preferred.id})")
-        val gapStartNanos = System.nanoTime()
         var opened: android.media.AudioDeviceInfo? = null
         withContext(Dispatchers.IO) {
             for (device in candidates) {
@@ -548,12 +542,6 @@ class RecordingPipeline(private val context: Context) {
             return
         }
 
-        val gapNanos = System.nanoTime() - gapStartNanos
-        // Engine-rate frames (docs/HIRES_AUDIO_DESIGN.md §4/§6.5): insertSilence() pushes
-        // directly into the native ring buffer, which is always in actualCaptureRateHz
-        // frames regardless of the AAC track's fixed AUDIO_SAMPLE_RATE_HZ target.
-        val gapFrames = (gapNanos * actualCaptureRateHz / 1_000_000_000L).toInt()
-        withContext(Dispatchers.IO) { nativeEngine.insertSilence(gapFrames) }
         activeInputDeviceId = openedDevice.id
         notifyInputDeviceChanged(openedDevice)
     }
@@ -587,7 +575,6 @@ class RecordingPipeline(private val context: Context) {
     // User-configurable settings
     private var nextVideoConfig: CameraCapabilityInspector.VideoConfigCandidate? = null
     private var storageLocation: StorageLocation = StorageLocation.AppPrivate
-    private var segmentDurationMinutes: Int = 5
 
     private enum class PipelineState { IDLE, PREVIEWING, RECORDING }
     private var pipelineState = PipelineState.IDLE
@@ -626,15 +613,27 @@ class RecordingPipeline(private val context: Context) {
 
     private var videoEncoder: VideoEncoder? = null
     private var audioEncoder: AudioEncoder? = null
-    private var muxerController: SegmentedMuxerController? = null
+    private var muxerController: MuxerController? = null
     private var ptsClockDomain: PtsClockDomain? = null
     private var currentOutputDir: File? = null
 
     // Hi-res WAV サイドカー (docs/HIRES_AUDIO_DESIGN.md) — null unless this take actually
     // landed on a hi-res capture rate (see startRecording's construction site). Held here
-    // (not just inside AudioEncoder) so emergencyFinalizeCurrentSegment() can reach it,
+    // (not just inside AudioEncoder) so emergencyFinalizeRecording() can reach it,
     // mirroring muxerController's own reason for being a top-level field.
     private var hiResAudioSink: HiResAudioSink? = null
+
+    // Recorded-audio diagnostics (docs/AUDIO_INSTABILITY_INVESTIGATION_2026-07-18.md §12)
+    // not otherwise exposed — [videoEncoder]/[audioEncoder]/[muxerController] are private
+    // and recreated each take, so [CameraControlViewModel]'s periodic diagnostic poller
+    // (same pattern as its existing "Recorded-audio diagnostics:" log using [nativeEngine]'s
+    // ring-buffer counters) needs a stable delegator here. 0 whenever no take is running,
+    // same as the ring-buffer counters' own "closed" fallback in [NativeEngineBridge].
+    fun aacInputRetryCount(): Long = audioEncoder?.aacInputRetryCount() ?: 0L
+    fun aacInputMaxWaitNanos(): Long = audioEncoder?.aacInputMaxWaitNanos() ?: 0L
+    fun aacInputTimeoutFailureCount(): Long = audioEncoder?.aacInputTimeoutFailureCount() ?: 0L
+    fun muxerIoQueueBlockCount(): Long = muxerController?.ioQueueBlockCount() ?: 0L
+    fun muxerIoQueueBlockMaxNanos(): Long = muxerController?.ioQueueBlockMaxNanos() ?: 0L
 
     // ──────────────────────────────────────────────────────────────────────────────
     // Public methods
@@ -934,7 +933,12 @@ class RecordingPipeline(private val context: Context) {
             } ?: caps.videoConfig
 
             val takeTimestampMs = System.currentTimeMillis()
-            val formatter = java.text.SimpleDateFormat("yyyyMMddHHmm", java.util.Locale.getDefault()).apply {
+            // Milliseconds keep repeated takes started within the same minute/second from
+            // resolving to the same single-file path.
+            val formatter = java.text.SimpleDateFormat(
+                "yyyyMMdd_HHmmss_SSS",
+                java.util.Locale.getDefault(),
+            ).apply {
                 timeZone = java.util.TimeZone.getDefault()
             }
             val takeTimestampStr = formatter.format(java.util.Date(takeTimestampMs))
@@ -951,12 +955,13 @@ class RecordingPipeline(private val context: Context) {
             val orientationHint = orientationTracker.orientationHintDegreesFor(
                 sessionController.characteristicsFor(caps.cameraId),
             )
-            val muxer = SegmentedMuxerController(
-                outputPathForSegment = { index ->
-                    File(outputDir, "${APP_NAME_TAG}_${takeTimestampStr}_segment_$index.mp4").absolutePath
-                },
-                segmentDurationUs = segmentDurationMinutes * 60 * 1_000_000L,
+            val muxer = MuxerController(
+                outputPath = File(
+                    outputDir,
+                    "${APP_NAME_TAG}_${takeTimestampStr}.mp4",
+                ).absolutePath,
                 orientationHintDegrees = orientationHint,
+                onError = { exception -> onEncoderError("MuxerController", exception, onEvent) },
             )
             muxerController = muxer
 
@@ -987,16 +992,16 @@ class RecordingPipeline(private val context: Context) {
             // the engine actually landed on a rate above the AAC track's fixed target (a
             // hi-res *request* that fell back to 48kHz gets no sidecar, matching
             // notifyAudioFormatChanged's "48kHz (ハイレゾ非対応デバイス)" label: there is
-            // nothing lossless-and-higher-rate to capture in that case). Segmented the same
-            // way as the MP4 (same take timestamp, same segmentDurationMinutes).
+            // nothing lossless-and-higher-rate to capture in that case). One recording
+            // produces one WAV sidecar alongside its one MP4.
             val hiResSink = if (actualCaptureRateHz > AUDIO_SAMPLE_RATE_HZ) {
                 HiResAudioSink(
-                    outputPathForSegment = { index ->
-                        File(outputDir, "${APP_NAME_TAG}_${takeTimestampStr}_segment_$index.wav").absolutePath
-                    },
+                    outputPath = File(
+                        outputDir,
+                        "${APP_NAME_TAG}_${takeTimestampStr}.wav",
+                    ).absolutePath,
                     sampleRateHz = actualCaptureRateHz,
                     channelCount = AUDIO_CHANNEL_COUNT,
-                    segmentDurationUs = segmentDurationMinutes * 60 * 1_000_000L,
                 )
             } else {
                 null
@@ -1157,11 +1162,6 @@ class RecordingPipeline(private val context: Context) {
         storageLocation = location
     }
 
-    /** Sets how many minutes each segment file should be before a new file is opened. */
-    fun setSegmentDurationMinutes(minutes: Int) {
-        segmentDurationMinutes = minutes
-    }
-
     /**
      * Applies [params] to the live repeating request without restarting the session.
      * The Camera2 HAL replaces the previous request at the next frame boundary, so
@@ -1242,17 +1242,16 @@ class RecordingPipeline(private val context: Context) {
 
     /**
      * Best-effort crash-safety net (§4.6): closes whatever [MediaMuxer] is currently open
-     * (via [SegmentedMuxerController.stop]) so it gets a valid moov box, without trying to
+     * (via [MuxerController.stop]) so it gets a valid moov box, without trying to
      * cleanly signal EOS or drain the encoders first. Meant to be called from a
      * [Thread.UncaughtExceptionHandler] — see [com.aucampro.recorder.AuCamPROApplication]
      * — where the process is about to die and there is no time (or dispatcher guarantee)
      * for the normal suspend stop sequence.
      *
-     * Because [SegmentedMuxerController] finalizes each *past* segment as soon as
-     * rotation completes (see its class doc), only the current in-flight segment is ever
-     * at risk of being lost to a crash — this call is what saves *that* one. A few
-     * trailing frames already handed to the encoder but not yet delivered to the muxer
-     * callback are accepted as lost; the goal is a playable file, not a complete one.
+     * The whole take remains open until recording stops, so this call attempts to save
+     * that one in-flight file. A few trailing frames already handed to the encoder but
+     * not yet delivered to the muxer callback are accepted as lost; the goal is a
+     * playable file, not a complete one.
      *
      * Deliberately swallows all exceptions — this runs during process teardown and must
      * never throw past the caller (which re-throws to the platform's default crash
@@ -1262,12 +1261,12 @@ class RecordingPipeline(private val context: Context) {
      * まだ行っていない(ネイティブクラッシュ・ANR・強制killはこの経路では
      * そもそも救えない——JVM例外ハンドラが呼ばれるケースのみ対象)。
      */
-    fun emergencyFinalizeCurrentSegment() {
+    fun emergencyFinalizeRecording() {
         try {
             muxerController?.stop()
-            Log.w(TAG, "emergencyFinalizeCurrentSegment: muxer finalized")
+            Log.w(TAG, "emergencyFinalizeRecording: muxer finalized")
         } catch (e: Throwable) {
-            Log.e(TAG, "emergencyFinalizeCurrentSegment failed", e)
+            Log.e(TAG, "emergencyFinalizeRecording failed", e)
         }
         try {
             // Same best-effort acceptance as the muxer above (docs/HIRES_AUDIO_DESIGN.md
@@ -1275,9 +1274,9 @@ class RecordingPipeline(private val context: Context) {
             // is still alive when the crash handler runs; WavFileWriter.close()'s
             // back-patch is idempotent so this is safe to call regardless.
             hiResAudioSink?.close()
-            Log.w(TAG, "emergencyFinalizeCurrentSegment: hi-res WAV finalized")
+            Log.w(TAG, "emergencyFinalizeRecording: hi-res WAV finalized")
         } catch (e: Throwable) {
-            Log.e(TAG, "emergencyFinalizeCurrentSegment (WAV) failed", e)
+            Log.e(TAG, "emergencyFinalizeRecording (WAV) failed", e)
         }
     }
 

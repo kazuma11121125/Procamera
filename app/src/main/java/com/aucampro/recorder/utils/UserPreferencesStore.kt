@@ -44,7 +44,6 @@ class UserPreferencesStore(context: Context) {
         val highPassCutoffHz: Float,
         val monitoringEnabled: Boolean,
         val storageLocation: StorageLocation,
-        val segmentDurationMinutes: Int?,
         val videoConfigWidth: Int?,
         val videoConfigHeight: Int?,
         val videoConfigFps: Int?,
@@ -74,7 +73,6 @@ class UserPreferencesStore(context: Context) {
         highPassCutoffHz = prefs.getFloat(KEY_HIGH_PASS_CUTOFF, 100f),
         monitoringEnabled = prefs.getBoolean(KEY_MONITORING, false),
         storageLocation = loadStorageLocation(),
-        segmentDurationMinutes = prefs.getInt(KEY_SEGMENT_MINUTES, -1).takeIf { it > 0 },
         videoConfigWidth = prefs.getInt(KEY_VIDEO_W, -1).takeIf { it > 0 },
         videoConfigHeight = prefs.getInt(KEY_VIDEO_H, -1).takeIf { it > 0 },
         videoConfigFps = prefs.getInt(KEY_VIDEO_FPS, -1).takeIf { it > 0 },
@@ -134,8 +132,6 @@ class UserPreferencesStore(context: Context) {
             putBoolean(KEY_HIGH_PASS_ENABLED, state.highPassEnabled)
             putFloat(KEY_HIGH_PASS_CUTOFF, state.highPassCutoffHz)
             putBoolean(KEY_MONITORING, state.monitoringEnabled)
-            putInt(KEY_SEGMENT_MINUTES, state.settings.segmentDurationMinutes)
-
             when (val location = state.settings.storageLocation) {
                 StorageLocation.AppPrivate -> putString(KEY_STORAGE_LOCATION_KIND, "AppPrivate")
                 StorageLocation.PublicMovies -> putString(KEY_STORAGE_LOCATION_KIND, "PublicMovies")
@@ -179,7 +175,6 @@ class UserPreferencesStore(context: Context) {
         const val KEY_HIGH_PASS_ENABLED = "high_pass_enabled"
         const val KEY_HIGH_PASS_CUTOFF = "high_pass_cutoff_hz"
         const val KEY_MONITORING = "monitoring_enabled"
-        const val KEY_SEGMENT_MINUTES = "segment_duration_minutes"
         const val KEY_VIDEO_W = "video_config_width"
         const val KEY_VIDEO_H = "video_config_height"
         const val KEY_VIDEO_FPS = "video_config_fps"

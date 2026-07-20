@@ -4,6 +4,7 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.view.Surface
+import com.aucampro.recorder.camera.CameraSessionMetrics
 import com.aucampro.recorder.muxer.PtsClockDomain
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
@@ -105,6 +106,11 @@ class VideoEncoder(
                 // with no corresponding video.
                 if (!ptsClockDomain.isStarted()) {
                     ptsClockDomain.start(presentationTimeNanos)
+                    // docs/CAMERA_SESSION_LATENCY_2026-07-21.md Phase 1 — this `isStarted()`
+                    // guard already fires exactly once per recording (the real anchor point
+                    // this class exists to establish, see this method's own doc above), so
+                    // it doubles as the one-shot "first real video frame" measurement point.
+                    CameraSessionMetrics.endFirstVideoFrame(CameraSessionMetrics.activeRecordingAttemptId())
                 }
                 val normalizedPtsUs = ptsClockDomain.normalizeVideoPtsUs(presentationTimeNanos)
                 if (normalizedPtsUs == null) {

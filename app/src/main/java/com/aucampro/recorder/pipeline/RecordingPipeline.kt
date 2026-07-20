@@ -9,6 +9,7 @@ import android.media.MediaFormat
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.Trace
 import android.provider.MediaStore
 import android.util.Log
 import android.view.Surface
@@ -19,6 +20,7 @@ import com.aucampro.recorder.audio.NativeEngineBridge
 import com.aucampro.recorder.camera.CameraCapabilityInspector
 import com.aucampro.recorder.camera.CameraParams
 import com.aucampro.recorder.camera.CameraSessionController
+import com.aucampro.recorder.camera.CameraSessionMetrics
 import com.aucampro.recorder.camera.CaptureRangeClamper
 import com.aucampro.recorder.camera.ColorTemperatureConverter
 import com.aucampro.recorder.camera.ManualCaptureRequestFactory
@@ -33,6 +35,7 @@ import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
@@ -617,6 +620,11 @@ class RecordingPipeline(private val context: Context) {
     private var ptsClockDomain: PtsClockDomain? = null
     private var currentOutputDir: File? = null
 
+    // docs/CAMERA_SESSION_LATENCY_2026-07-21.md Phase 1 — debug-only (CameraSessionMetrics.
+    // startPeriodicDump is itself a no-op in release builds). Started once recording begins,
+    // cancelled as soon as it stops so nothing dumps outside an actual take.
+    private var metricsDumpJob: Job? = null
+
     // Hi-res WAV サイドカー (docs/HIRES_AUDIO_DESIGN.md) — null unless this take actually
     // landed on a hi-res capture rate (see startRecording's construction site). Held here
     // (not just inside AudioEncoder) so emergencyFinalizeRecording() can reach it,
@@ -741,14 +749,24 @@ class RecordingPipeline(private val context: Context) {
 
             var frameCount = 0
             sessionController.captureResultListener = CameraSessionController.CaptureResultListener { result ->
+                // docs/CAMERA_SESSION_LATENCY_2026-07-21.md Phase 1: `sampled` gates only the
+                // Trace section markers below, not any actual logic — measurement-only,
+                // shared across the sub-sections in this listener so they light up on the
+                // same sampled frames rather than independently.
+                val sampled = CameraSessionMetrics.shouldSampleThisFrame()
+
                 // Every frame, not throttled like the WB/AF passive-measurement block below
                 // — a tap-to-focus scan needs to see CONTROL_AF_STATE transitions promptly
                 // to feel responsive (no-op when no scan is in progress; see this method's
                 // own doc for why it's cheap to call unconditionally).
+                if (sampled) Trace.beginSection("AuCam:focusResultSample")
                 focusController?.onCaptureResult(result, System.nanoTime())
+                if (sampled) Trace.endSection()
 
                 frameCount++
                 if (frameCount % 10 == 0) {
+                    val wbAfTracing = CameraSessionMetrics.tracingActive()
+                    if (wbAfTracing) Trace.beginSection("AuCam:wbAfMeasurement")
                     if (currentParams?.wbAuto == true) {
                         val gains = result.get(android.hardware.camera2.CaptureResult.COLOR_CORRECTION_GAINS)
                         if (gains != null) {
@@ -770,6 +788,7 @@ class RecordingPipeline(private val context: Context) {
                             Log.w("RecordingPipeline", "AF is AUTO but LENS_FOCUS_DISTANCE is null")
                         }
                     }
+                    if (wbAfTracing) Trace.endSection()
                 }
             }
 
@@ -913,7 +932,15 @@ class RecordingPipeline(private val context: Context) {
             return
         }
 
+        // docs/CAMERA_SESSION_LATENCY_2026-07-21.md Phase 1: one id per attempt, correlating
+        // this method's own async span with the two longer-lived ones VideoEncoder/
+        // MuxerController close on the first real frame/sample they see (read back via
+        // CameraSessionMetrics.activeRecordingAttemptId() — see that method's doc for why a
+        // constructor-parameter thread wasn't used instead). Declared before `try` so the
+        // catch block below can also close it.
+        var metricsAttemptId = 0
         try {
+            metricsAttemptId = CameraSessionMetrics.beginRecordingAttempt()
             recordingErrorHandled.set(false)
 
             // 実機で発見・修正 (2026-07-18, PtsClockDomain.isStarted's doc): epoch is no
@@ -965,24 +992,26 @@ class RecordingPipeline(private val context: Context) {
             )
             muxerController = muxer
 
-            val video = VideoEncoder(
-                mimeType = recordingVideoConfig.mimeType,
-                width = recordingVideoConfig.width,
-                height = recordingVideoConfig.height,
-                frameRate = recordingVideoConfig.frameRate,
-                bitrate = recordingVideoConfig.bitrate,
-                ptsClockDomain = pts,
-                callback = object : VideoEncoder.Callback {
-                    override fun onOutputFormatChanged(format: MediaFormat) =
-                        muxer.onVideoFormatChanged(format)
+            val video = CameraSessionMetrics.traceSync("AuCam:startRecording:encoderConfigure") {
+                VideoEncoder(
+                    mimeType = recordingVideoConfig.mimeType,
+                    width = recordingVideoConfig.width,
+                    height = recordingVideoConfig.height,
+                    frameRate = recordingVideoConfig.frameRate,
+                    bitrate = recordingVideoConfig.bitrate,
+                    ptsClockDomain = pts,
+                    callback = object : VideoEncoder.Callback {
+                        override fun onOutputFormatChanged(format: MediaFormat) =
+                            muxer.onVideoFormatChanged(format)
 
-                    override fun onEncodedFrame(buffer: ByteBuffer, bufferInfo: MediaCodec.BufferInfo) =
-                        muxer.onVideoSample(buffer, bufferInfo)
+                        override fun onEncodedFrame(buffer: ByteBuffer, bufferInfo: MediaCodec.BufferInfo) =
+                            muxer.onVideoSample(buffer, bufferInfo)
 
-                    override fun onError(exception: Exception) =
-                        onEncoderError("VideoEncoder", exception, onEvent)
-                },
-            )
+                        override fun onError(exception: Exception) =
+                            onEncoderError("VideoEncoder", exception, onEvent)
+                    },
+                )
+            }
             videoEncoder = video
 
             val engineError = ensureAudioEngineStarted()
@@ -1029,7 +1058,7 @@ class RecordingPipeline(private val context: Context) {
             )
             audioEncoder = audio
 
-            video.start()
+            CameraSessionMetrics.traceSync("AuCam:startRecording:encoderStart") { video.start() }
             // AudioEncoder.start() seeds PtsClockDomain's audio anchor itself (retrying
             // NativeEngineBridge.getInputTimestamp() for frame-correlation accuracy — see
             // its doc and docs/ARCHITECTURE.md §Phase3). nativeEngine.start() must complete
@@ -1044,19 +1073,25 @@ class RecordingPipeline(private val context: Context) {
             // configuration, not reducible by this call alone) and why the device itself
             // is deliberately kept open rather than closed+reopened here.
             sessionMutex.withLock {
-                sessionController.reconfigureSession(
-                    cameraId = lens.cameraId,
-                    outputSurfaces = listOfNotNull(previewSurface, video.inputSurface),
-                    requestFactory = factory,
-                    params = currentParams,
-                )
+                CameraSessionMetrics.traceAsync("AuCam:startRecording:cameraSessionReconfigure") {
+                    sessionController.reconfigureSession(
+                        cameraId = lens.cameraId,
+                        outputSurfaces = listOfNotNull(previewSurface, video.inputSurface),
+                        requestFactory = factory,
+                        params = currentParams,
+                    )
+                }
             }
 
             pipelineState = PipelineState.RECORDING
             Log.i(TAG, "Recording started → $outputDir")
+            metricsDumpJob = CameraSessionMetrics.startPeriodicDump(pipelineScope)
+            CameraSessionMetrics.endStartRecordingSpan(metricsAttemptId)
             onEvent(Event.Started(outputDir))
         } catch (e: Exception) {
             Log.e(TAG, "startRecording failed", e)
+            CameraSessionMetrics.endStartRecordingSpan(metricsAttemptId)
+            CameraSessionMetrics.abortDanglingRecordingSpans(metricsAttemptId)
             sessionMutex.withLock { stopRecordingInternalLocked(restartPreview = false) }
             onEvent(Event.Failed(e.message ?: e.toString(), sessionStopped = true))
         }
@@ -1293,6 +1328,9 @@ class RecordingPipeline(private val context: Context) {
      * just be reused there.
      */
     private fun stopRecordingInternalLocked(restartPreview: Boolean) {
+        metricsDumpJob?.cancel()
+        metricsDumpJob = null
+        CameraSessionMetrics.abortDanglingRecordingSpans(CameraSessionMetrics.activeRecordingAttemptId())
         // Camera session stops (see stop-sequence doc above); the audio *engine* deliberately
         // does NOT stop here anymore — it keeps running for the meter across the return to
         // Previewing (see [ensureAudioEngineStarted]'s doc). Only the AudioEncoder's drain
@@ -1362,6 +1400,9 @@ class RecordingPipeline(private val context: Context) {
      * for another.
      */
     private suspend fun stopRecordingInternalLockedAsync() {
+        metricsDumpJob?.cancel()
+        metricsDumpJob = null
+        CameraSessionMetrics.abortDanglingRecordingSpans(CameraSessionMetrics.activeRecordingAttemptId())
         sessionController.stop()
 
         val video = videoEncoder

@@ -12,6 +12,8 @@ import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
+import android.os.Trace
 import android.util.Log
 import android.view.Surface
 import androidx.annotation.RequiresPermission
@@ -108,11 +110,11 @@ class CameraSessionController(private val cameraManager: CameraManager) {
         activeRequestFactory = requestFactory
         activeParams = params
 
-        captureSession.setRepeatingRequest(
-            buildRequest(cameraDevice, requestFactory, params),
-            makeCaptureCallback(),
-            callbackHandler,
-        )
+        val request = buildRequest(cameraDevice, requestFactory, params)
+        CameraSessionMetrics.traceSync("AuCam:setRepeatingRequest") {
+            captureSession.setRepeatingRequest(request, makeCaptureCallback(), callbackHandler)
+        }
+        CameraSessionMetrics.onSetRepeatingRequest(CameraSessionMetrics.RepeatingRequestReason.START_REPEATING)
     }
 
     /**
@@ -163,10 +165,12 @@ class CameraSessionController(private val cameraManager: CameraManager) {
             return
         }
 
-        try {
-            session?.abortCaptures()
-        } catch (e: Exception) {
-            Log.w(TAG, "reconfigureSession: abortCaptures failed, proceeding anyway", e)
+        CameraSessionMetrics.traceSync("AuCam:abortCaptures") {
+            try {
+                session?.abortCaptures()
+            } catch (e: Exception) {
+                Log.w(TAG, "reconfigureSession: abortCaptures failed, proceeding anyway", e)
+            }
         }
 
         // Deliberately no session?.close() here — see this method's doc for why creating
@@ -179,11 +183,11 @@ class CameraSessionController(private val cameraManager: CameraManager) {
         activeRequestFactory = requestFactory
         activeParams = params
 
-        captureSession.setRepeatingRequest(
-            buildRequest(existingDevice, requestFactory, params),
-            makeCaptureCallback(),
-            callbackHandler,
-        )
+        val request = buildRequest(existingDevice, requestFactory, params)
+        CameraSessionMetrics.traceSync("AuCam:setRepeatingRequest") {
+            captureSession.setRepeatingRequest(request, makeCaptureCallback(), callbackHandler)
+        }
+        CameraSessionMetrics.onSetRepeatingRequest(CameraSessionMetrics.RepeatingRequestReason.SESSION_RECONFIGURE)
     }
 
     /**
@@ -214,11 +218,11 @@ class CameraSessionController(private val cameraManager: CameraManager) {
 
         activeParams = params
         try {
-            currentSession.setRepeatingRequest(
-                buildRequest(currentDevice, factory, params),
-                makeCaptureCallback(),
-                callbackHandler,
-            )
+            val request = buildRequest(currentDevice, factory, params)
+            CameraSessionMetrics.traceSync("AuCam:setRepeatingRequest") {
+                currentSession.setRepeatingRequest(request, makeCaptureCallback(), callbackHandler)
+            }
+            CameraSessionMetrics.onSetRepeatingRequest(CameraSessionMetrics.RepeatingRequestReason.PARAM_UPDATE)
         } catch (e: IllegalStateException) {
             Log.w(TAG, "updateCaptureParams: session/device closed mid-call, ignoring", e)
         }
@@ -284,10 +288,12 @@ class CameraSessionController(private val cameraManager: CameraManager) {
         // mid-teardown (e.g. a device disconnect racing this call), so this is
         // best-effort, same as the other CameraAccessException/IllegalStateException
         // guards in this file.
-        try {
-            session?.abortCaptures()
-        } catch (e: Exception) {
-            Log.w(TAG, "stop: abortCaptures failed, proceeding to close anyway", e)
+        CameraSessionMetrics.traceSync("AuCam:abortCaptures") {
+            try {
+                session?.abortCaptures()
+            } catch (e: Exception) {
+                Log.w(TAG, "stop: abortCaptures failed, proceeding to close anyway", e)
+            }
         }
         session?.close()
         device?.close()
@@ -323,7 +329,7 @@ class CameraSessionController(private val cameraManager: CameraManager) {
         device: CameraDevice,
         factory: ManualCaptureRequestFactory,
         params: CameraParams,
-    ): CaptureRequest.Builder {
+    ): CaptureRequest.Builder = CameraSessionMetrics.traceSync("AuCam:buildCaptureRequest") {
         val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
         activeSurfaces.forEach { builder.addTarget(it) }
         // [ExposureMode]分岐(動画/プレビューのリピートリクエスト専用)。[capturePhoto]は
@@ -340,7 +346,8 @@ class CameraSessionController(private val cameraManager: CameraManager) {
         factory.applyFocus(builder, params.focusDistanceDiopters, params.afAuto)
         factory.applyWhiteBalance(builder, params)
         factory.applyZoom(builder, params.zoomRatio)
-        return builder
+        CameraSessionMetrics.onCaptureRequestBuilderCreated()
+        builder
     }
 
     /**
@@ -373,7 +380,11 @@ class CameraSessionController(private val cameraManager: CameraManager) {
         try {
             val builder = buildRequestBuilder(currentDevice, factory, params)
             configure(builder)
-            currentSession.setRepeatingRequest(builder.build(), makeCaptureCallback(), callbackHandler)
+            val request = builder.build()
+            CameraSessionMetrics.traceSync("AuCam:setRepeatingRequest") {
+                currentSession.setRepeatingRequest(request, makeCaptureCallback(), callbackHandler)
+            }
+            CameraSessionMetrics.onSetRepeatingRequest(CameraSessionMetrics.RepeatingRequestReason.FOCUS_REQUEST)
         } catch (e: IllegalStateException) {
             Log.w(TAG, "submitSingleRequest: session/device closed mid-call, ignoring", e)
         }
@@ -386,80 +397,98 @@ class CameraSessionController(private val cameraManager: CameraManager) {
                 request: CaptureRequest,
                 result: TotalCaptureResult,
             ) {
-                captureResultListener?.onCaptureResult(result)
+                CameraSessionMetrics.onCaptureCallbackInvoked()
+                val startNanos = SystemClock.elapsedRealtimeNanos()
+                val sampled = CameraSessionMetrics.shouldSampleThisFrame()
+                if (sampled) Trace.beginSection("AuCam:captureCallbackSample")
+                val listener = captureResultListener
+                if (listener != null) {
+                    CameraSessionMetrics.onCaptureResultListenerInvoked()
+                    listener.onCaptureResult(result)
+                }
+                if (sampled) Trace.endSection()
+                CameraSessionMetrics.recordCaptureCallbackDurationNanos(
+                    SystemClock.elapsedRealtimeNanos() - startNanos,
+                )
             }
         }
 
     @RequiresPermission(Manifest.permission.CAMERA)
     private suspend fun openCamera(cameraId: String): CameraDevice =
-        suspendCancellableCoroutine { cont ->
-            cameraManager.openCamera(
-                cameraId,
-                object : CameraDevice.StateCallback() {
-                    override fun onOpened(camera: CameraDevice) {
-                        if (cont.isActive) {
-                            cont.resume(camera)
-                        } else {
-                            // The coroutine was cancelled while the camera was opening
-                            // (e.g. the caller backgrounded mid-open) — resume() on an
-                            // already-cancelled continuation silently discards `camera`
-                            // without closing it, leaking the exclusive camera hardware
-                            // lock. That can block every future openCamera() call, by
-                            // this app or another, until the OS eventually reclaims it.
+        CameraSessionMetrics.traceAsync("AuCam:openCamera") {
+            CameraSessionMetrics.onOpenCamera()
+            suspendCancellableCoroutine { cont ->
+                cameraManager.openCamera(
+                    cameraId,
+                    object : CameraDevice.StateCallback() {
+                        override fun onOpened(camera: CameraDevice) {
+                            if (cont.isActive) {
+                                cont.resume(camera)
+                            } else {
+                                // The coroutine was cancelled while the camera was opening
+                                // (e.g. the caller backgrounded mid-open) — resume() on an
+                                // already-cancelled continuation silently discards `camera`
+                                // without closing it, leaking the exclusive camera hardware
+                                // lock. That can block every future openCamera() call, by
+                                // this app or another, until the OS eventually reclaims it.
+                                camera.close()
+                            }
+                        }
+
+                        override fun onDisconnected(camera: CameraDevice) {
                             camera.close()
+                            if (cont.isActive) {
+                                cont.resumeWithException(
+                                    IllegalStateException("Camera $cameraId disconnected"),
+                                )
+                            }
                         }
-                    }
 
-                    override fun onDisconnected(camera: CameraDevice) {
-                        camera.close()
-                        if (cont.isActive) {
-                            cont.resumeWithException(
-                                IllegalStateException("Camera $cameraId disconnected"),
-                            )
+                        override fun onError(camera: CameraDevice, error: Int) {
+                            camera.close()
+                            if (cont.isActive) {
+                                cont.resumeWithException(
+                                    IllegalStateException("Camera $cameraId error: $error"),
+                                )
+                            }
                         }
-                    }
-
-                    override fun onError(camera: CameraDevice, error: Int) {
-                        camera.close()
-                        if (cont.isActive) {
-                            cont.resumeWithException(
-                                IllegalStateException("Camera $cameraId error: $error"),
-                            )
-                        }
-                    }
-                },
-                callbackHandler,
-            )
+                    },
+                    callbackHandler,
+                )
+            }
         }
 
     private suspend fun createSession(
         cameraDevice: CameraDevice,
         surfaces: List<Surface>,
-    ): CameraCaptureSession = suspendCancellableCoroutine { cont ->
-        val outputConfigs = surfaces.map { OutputConfiguration(it) }
-        val config = SessionConfiguration(
-            SessionConfiguration.SESSION_REGULAR,
-            outputConfigs,
-            callbackExecutor,
-            object : CameraCaptureSession.StateCallback() {
-                override fun onConfigured(session: CameraCaptureSession) {
-                    if (cont.isActive) {
-                        cont.resume(session)
-                    } else {
-                        session.close()
+    ): CameraCaptureSession = CameraSessionMetrics.traceAsync("AuCam:createSession") {
+        CameraSessionMetrics.onCreateCaptureSession()
+        suspendCancellableCoroutine { cont ->
+            val outputConfigs = surfaces.map { OutputConfiguration(it) }
+            val config = SessionConfiguration(
+                SessionConfiguration.SESSION_REGULAR,
+                outputConfigs,
+                callbackExecutor,
+                object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(session: CameraCaptureSession) {
+                        if (cont.isActive) {
+                            cont.resume(session)
+                        } else {
+                            session.close()
+                        }
                     }
-                }
 
-                override fun onConfigureFailed(session: CameraCaptureSession) {
-                    session.close()
-                    if (cont.isActive) {
-                        cont.resumeWithException(
-                            IllegalStateException("Camera session configuration failed"),
-                        )
+                    override fun onConfigureFailed(session: CameraCaptureSession) {
+                        session.close()
+                        if (cont.isActive) {
+                            cont.resumeWithException(
+                                IllegalStateException("Camera session configuration failed"),
+                            )
+                        }
                     }
-                }
-            },
-        )
-        cameraDevice.createCaptureSession(config)
+                },
+            )
+            cameraDevice.createCaptureSession(config)
+        }
     }
 }

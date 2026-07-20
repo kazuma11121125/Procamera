@@ -4,6 +4,7 @@ import android.media.MediaCodec
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.util.Log
+import com.aucampro.recorder.camera.CameraSessionMetrics
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
@@ -209,6 +210,13 @@ class MuxerController(
         val trackIndex = if (isVideo) videoTrack else audioTrack
         try {
             current.writeSampleData(trackIndex, buffer, bufferInfo)
+            // docs/CAMERA_SESSION_LATENCY_2026-07-21.md Phase 1 — one-shot per recording
+            // attempt (CameraSessionMetrics.endFirstMuxerVideoSample no-ops after the first
+            // call), so unconditionally calling this on every video write is cheap and
+            // correct without an extra guard here.
+            if (isVideo) {
+                CameraSessionMetrics.endFirstMuxerVideoSample(CameraSessionMetrics.activeRecordingAttemptId())
+            }
         } catch (e: Exception) {
             reportError(e)
         }

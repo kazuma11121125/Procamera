@@ -628,10 +628,25 @@ class CameraControlViewModel(app: Application) : AndroidViewModel(app) {
      * already greys out via [CameraUiState.canCapturePhoto], but that's a Compose
      * `pointerInput` gate the *hardware* camera key's [onShutterPressed] path
      * (`MainActivity.dispatchKeyEvent`) never goes through — this check is the one that
-     * actually stops a hardware-key press, not just a second line of defense. */
+     * actually stops a hardware-key press, not just a second line of defense.
+     *
+     * Surfaces [CameraUiState.errorMessage] specifically for the Auto-mode case (not for
+     * "not previewing"/"recording", which stay silent — the on-screen controls already
+     * make those states obvious) since a user in Auto mode pressing the hardware camera
+     * key would otherwise see no feedback at all for why nothing happened. */
     @Suppress("MissingPermission") // only reachable once MainScreen (and PermissionGate) is composed
     fun capturePhoto() {
-        if (!_uiState.value.canCapturePhoto) return
+        val state = _uiState.value
+        if (!state.isPreviewing) return
+        if (state.exposureMode == ExposureMode.AUTO) {
+            _uiState.update {
+                it.copy(
+                    errorMessage = "AUTO露出中は、この端末のカメラ互換性問題により静止画撮影を使用できません。" +
+                        "MANUALへ切り替えてください。",
+                )
+            }
+            return
+        }
         pipeline.capturePhoto()
     }
 

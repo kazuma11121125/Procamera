@@ -307,8 +307,13 @@ fun MainScreen(
                         // is PREVIEWING-only) — see CameraControlViewModel.capturePhoto's
                         // doc for the real-device crash this avoids. RECORDING can't
                         // actually happen while in Photo mode (the toggle above is disabled
-                        // mid-recording), but this mirrors the ViewModel's own guard as a
-                        // second line of defense rather than assuming that invariant here.
+                        // mid-recording), so that part is a second line of defense here.
+                        //
+                        // Auto exposure is different: tapping while in Auto still calls
+                        // through to viewModel.capturePhoto() (not gated here) so its
+                        // errorMessage banner actually surfaces — a silent no-op here would
+                        // leave a hardware-key-less user with zero feedback for why nothing
+                        // happened.
                         //
                         // §AF/MFモード, シャッター半押し相当: a touchscreen button has no
                         // real two-stage press, so ACTION_DOWN triggers AF (mirroring a
@@ -320,8 +325,8 @@ fun MainScreen(
                                 .size(36.dp)
                                 .clip(CircleShape)
                                 .border(1.dp, OnSurfaceSecondary.copy(alpha = 0.5f), CircleShape)
-                                .pointerInput(state.canCapturePhoto) {
-                                    if (!state.canCapturePhoto) return@pointerInput
+                                .pointerInput(state.isPreviewing) {
+                                    if (!state.isPreviewing) return@pointerInput
                                     awaitEachGesture {
                                         awaitFirstDown()
                                         viewModel.onShutterHalfPress()

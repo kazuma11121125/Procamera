@@ -37,6 +37,17 @@ class VideoEncoder(
     bitrate: Int,
     private val ptsClockDomain: PtsClockDomain,
     private val callback: Callback,
+    /** docs/CAMERA_SESSION_LATENCY_2026-07-21.md Phase 1 — captured once here, at
+     * construction time, rather than read dynamically from
+     * `CameraSessionMetrics.activeRecordingAttemptId()` inside [onOutputBufferAvailable]:
+     * that callback can fire on `MediaCodec`'s own callback thread after this recording
+     * attempt has already ended (e.g. a buffer still draining during stop), by which point
+     * the *next* attempt may have already incremented the "current" attempt id. A stale
+     * dynamic read would then incorrectly close the next attempt's still-open
+     * `AuCam:recordingToFirstVideoFrame` span using a callback that belongs to this one.
+     * Capturing the id as a `val` sidesteps that entirely — this instance always reports
+     * against the attempt it was actually created for. */
+    private val recordingAttemptId: Int = CameraSessionMetrics.activeRecordingAttemptId(),
 ) {
     interface Callback {
         fun onOutputFormatChanged(format: MediaFormat)
@@ -110,7 +121,7 @@ class VideoEncoder(
                     // guard already fires exactly once per recording (the real anchor point
                     // this class exists to establish, see this method's own doc above), so
                     // it doubles as the one-shot "first real video frame" measurement point.
-                    CameraSessionMetrics.endFirstVideoFrame(CameraSessionMetrics.activeRecordingAttemptId())
+                    CameraSessionMetrics.endFirstVideoFrame(recordingAttemptId)
                 }
                 val normalizedPtsUs = ptsClockDomain.normalizeVideoPtsUs(presentationTimeNanos)
                 if (normalizedPtsUs == null) {

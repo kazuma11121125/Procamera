@@ -39,6 +39,12 @@ class MuxerController(
      * pipeline cleanup.
      */
     private val onError: (Exception) -> Unit = {},
+    /** docs/CAMERA_SESSION_LATENCY_2026-07-21.md Phase 1 — see [VideoEncoder]'s identically-
+     * reasoned constructor parameter doc: captured once here rather than read dynamically
+     * from `CameraSessionMetrics.activeRecordingAttemptId()` on the I/O executor thread at
+     * write() time, so a late write from a still-draining previous attempt can never close
+     * the *next* attempt's still-open `AuCam:recordingToFirstMuxerVideoSample` span. */
+    private val recordingAttemptId: Int = CameraSessionMetrics.activeRecordingAttemptId(),
 ) {
     private data class PendingSample(
         val isVideo: Boolean,
@@ -215,7 +221,7 @@ class MuxerController(
             // call), so unconditionally calling this on every video write is cheap and
             // correct without an extra guard here.
             if (isVideo) {
-                CameraSessionMetrics.endFirstMuxerVideoSample(CameraSessionMetrics.activeRecordingAttemptId())
+                CameraSessionMetrics.endFirstMuxerVideoSample(recordingAttemptId)
             }
         } catch (e: Exception) {
             reportError(e)

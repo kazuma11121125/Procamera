@@ -1013,6 +1013,7 @@ class RecordingPipeline(private val context: Context) {
                 )
             }
             videoEncoder = video
+            CameraSessionMetrics.logStage(metricsAttemptId, "T1_encoderConfigured")
 
             val engineError = ensureAudioEngineStarted()
             if (engineError != null) error("Audio engine failed to start: $engineError")
@@ -1059,6 +1060,7 @@ class RecordingPipeline(private val context: Context) {
             audioEncoder = audio
 
             CameraSessionMetrics.traceSync("AuCam:startRecording:encoderStart") { video.start() }
+            CameraSessionMetrics.logStage(metricsAttemptId, "T2_encoderStarted")
             // AudioEncoder.start() seeds PtsClockDomain's audio anchor itself (retrying
             // NativeEngineBridge.getInputTimestamp() for frame-correlation accuracy — see
             // its doc and docs/ARCHITECTURE.md §Phase3). nativeEngine.start() must complete
@@ -1087,6 +1089,7 @@ class RecordingPipeline(private val context: Context) {
             Log.i(TAG, "Recording started → $outputDir")
             metricsDumpJob = CameraSessionMetrics.startPeriodicDump(pipelineScope)
             CameraSessionMetrics.endStartRecordingSpan(metricsAttemptId)
+            CameraSessionMetrics.logStage(metricsAttemptId, "T7_eventStarted")
             onEvent(Event.Started(outputDir))
         } catch (e: Exception) {
             Log.e(TAG, "startRecording failed", e)

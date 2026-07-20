@@ -1,5 +1,6 @@
 package com.aucampro.recorder.camera
 
+import android.os.SystemClock
 import android.os.Trace
 import android.util.Log
 import com.aucampro.recorder.BuildConfig
@@ -220,7 +221,19 @@ object CameraSessionMetrics {
             Trace.beginAsyncSection("AuCam:recordingToFirstVideoFrame", id)
             Trace.beginAsyncSection("AuCam:recordingToFirstMuxerVideoSample", id)
         }
+        logStage(id, "T0_startRecordingEntered")
         return id
+    }
+
+    /** Plain-text stage timestamp, once per named stage per recording attempt — deliberately
+     * separate from the Trace spans above: extracting exact span durations back out of a
+     * captured `.perfetto-trace` needs `trace_processor_shell` (not necessarily available in
+     * every environment), whereas these lines are directly greppable from `adb logcat` with
+     * no extra tooling. Low-frequency (10 calls per recording, at most) — safe to call from
+     * whichever thread reaches each stage; never called from the CameraCallback thread. */
+    fun logStage(id: Int, stage: String) {
+        if (!ENABLED) return
+        Log.i(TAG, "stage recordingAttemptId=$id stage=$stage tNanos=${SystemClock.elapsedRealtimeNanos()}")
     }
 
     /** The id [VideoEncoder]/[com.aucampro.recorder.muxer.MuxerController] read to close their
@@ -248,18 +261,21 @@ object CameraSessionMetrics {
     }
 
     /** One-shot; safe to call more than once (e.g. from both [VideoEncoder] and a defensive
-     * [endStartRecordingSpan] cleanup) — only the first call actually closes the span. */
-    fun endFirstVideoFrame(id: Int) {
-        if (firstVideoFrameEnded.compareAndSet(false, true)) {
-            if (ENABLED && Trace.isEnabled()) Trace.endAsyncSection("AuCam:recordingToFirstVideoFrame", id)
-        }
+     * [endStartRecordingSpan] cleanup) — only the first call actually closes the span.
+     * Returns whether *this* call was the one that closed it, so callers that also want a
+     * one-shot [logStage] (e.g. [VideoEncoder]'s T8) can gate on it instead of relying on an
+     * unrelated external guard to happen to also be one-shot. */
+    fun endFirstVideoFrame(id: Int): Boolean {
+        val wasFirst = firstVideoFrameEnded.compareAndSet(false, true)
+        if (wasFirst && ENABLED && Trace.isEnabled()) Trace.endAsyncSection("AuCam:recordingToFirstVideoFrame", id)
+        return wasFirst
     }
 
     /** One-shot; see [endFirstVideoFrame]'s doc. */
-    fun endFirstMuxerVideoSample(id: Int) {
-        if (firstMuxerVideoSampleEnded.compareAndSet(false, true)) {
-            if (ENABLED && Trace.isEnabled()) Trace.endAsyncSection("AuCam:recordingToFirstMuxerVideoSample", id)
-        }
+    fun endFirstMuxerVideoSample(id: Int): Boolean {
+        val wasFirst = firstMuxerVideoSampleEnded.compareAndSet(false, true)
+        if (wasFirst && ENABLED && Trace.isEnabled()) Trace.endAsyncSection("AuCam:recordingToFirstMuxerVideoSample", id)
+        return wasFirst
     }
 
     // ── Periodic dump ─────────────────────────────────────────────────────────────────────────

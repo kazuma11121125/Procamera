@@ -220,8 +220,8 @@ class MuxerController(
             // attempt (CameraSessionMetrics.endFirstMuxerVideoSample no-ops after the first
             // call), so unconditionally calling this on every video write is cheap and
             // correct without an extra guard here.
-            if (isVideo) {
-                CameraSessionMetrics.endFirstMuxerVideoSample(recordingAttemptId)
+            if (isVideo && CameraSessionMetrics.endFirstMuxerVideoSample(recordingAttemptId)) {
+                CameraSessionMetrics.logStage(recordingAttemptId, "T9_firstMuxerVideoSample")
             }
         } catch (e: Exception) {
             reportError(e)

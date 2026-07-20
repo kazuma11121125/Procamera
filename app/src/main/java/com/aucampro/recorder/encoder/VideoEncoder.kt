@@ -121,7 +121,9 @@ class VideoEncoder(
                     // guard already fires exactly once per recording (the real anchor point
                     // this class exists to establish, see this method's own doc above), so
                     // it doubles as the one-shot "first real video frame" measurement point.
-                    CameraSessionMetrics.endFirstVideoFrame(recordingAttemptId)
+                    if (CameraSessionMetrics.endFirstVideoFrame(recordingAttemptId)) {
+                        CameraSessionMetrics.logStage(recordingAttemptId, "T8_firstVideoFrame")
+                    }
                 }
                 val normalizedPtsUs = ptsClockDomain.normalizeVideoPtsUs(presentationTimeNanos)
                 if (normalizedPtsUs == null) {

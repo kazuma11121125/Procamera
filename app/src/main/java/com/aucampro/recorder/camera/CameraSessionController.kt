@@ -172,12 +172,23 @@ class CameraSessionController(private val cameraManager: CameraManager) {
                 Log.w(TAG, "reconfigureSession: abortCaptures failed, proceeding anyway", e)
             }
         }
+        // docs/CAMERA_SESSION_LATENCY_2026-07-21.md Phase 1 — reconfigureSession() is only
+        // ever called for a recording-related surface-set change (record-start, or a
+        // detach/reattach mid-recording), so CameraSessionMetrics.activeRecordingAttemptId()
+        // always refers to the attempt this call belongs to, unlike VideoEncoder/
+        // MuxerController's async callbacks (see their own docs for why those needed a
+        // constructor-captured id instead — this call is synchronous within the same
+        // startRecording() invocation that set the id, so no next attempt can race it here).
+        val metricsAttemptId = CameraSessionMetrics.activeRecordingAttemptId()
+        CameraSessionMetrics.logStage(metricsAttemptId, "T3_abortCapturesComplete")
 
         // Deliberately no session?.close() here — see this method's doc for why creating
         // the new session directly on the still-open device is both faster and documented
         // as safe (the new session supersedes the old one).
+        CameraSessionMetrics.logStage(metricsAttemptId, "T4_createSessionBegin")
         val captureSession = createSession(existingDevice, outputSurfaces)
         session = captureSession
+        CameraSessionMetrics.logStage(metricsAttemptId, "T5_createSessionConfigured")
 
         activeSurfaces = repeatingTargets
         activeRequestFactory = requestFactory
@@ -188,6 +199,7 @@ class CameraSessionController(private val cameraManager: CameraManager) {
             captureSession.setRepeatingRequest(request, makeCaptureCallback(), callbackHandler)
         }
         CameraSessionMetrics.onSetRepeatingRequest(CameraSessionMetrics.RepeatingRequestReason.SESSION_RECONFIGURE)
+        CameraSessionMetrics.logStage(metricsAttemptId, "T6_setRepeatingRequestComplete")
     }
 
     /**
